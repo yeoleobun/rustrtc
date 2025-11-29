@@ -3,21 +3,18 @@ use rustrtc::media::{
     MediaError, MediaKind, MediaResult, MediaSample, MediaSource, Packetizer, VideoFrame,
     Vp8Payloader,
 };
+use rustrtc::{PeerConnection, RtcConfiguration, SdpType, SessionDescription, TransportMode};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::time::Interval;
 use webrtc::media::io::ivf_reader::IVFReader;
 
 #[tokio::main]
 async fn main() {
     let target_addr = "127.0.0.1:5004";
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    socket.connect(target_addr).await.unwrap();
-
     println!("RTP Sender started.");
     println!("Sending VP8 RTP to {}", target_addr);
     println!("Use the following SDP with ffplay:");
@@ -31,6 +28,32 @@ async fn main() {
     println!("a=rtpmap:96 VP8/90000");
     println!("------------------------------------------------");
     println!("Command: ffplay -protocol_whitelist file,udp,rtp -i examples/rtp_play.sdp");
+
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
+    let pc = PeerConnection::new(config);
+
+    let (sample_source, track) = rustrtc::media::sample_track(MediaKind::Video, 100);
+    pc.add_track(track).expect("failed to add track");
+
+    let offer = pc.create_offer().await.expect("failed to create offer");
+    pc.set_local_description(offer)
+        .expect("failed to set local description");
+
+    let remote_sdp_str = format!(
+        "v=0\r\n\
+         o=- 0 0 IN IP4 127.0.0.1\r\n\
+         s=-\r\n\
+         c=IN IP4 127.0.0.1\r\n\
+         t=0 0\r\n\
+         m=video 5004 RTP/AVP 96\r\n\
+         a=rtpmap:96 VP8/90000\r\n"
+    );
+    let remote_sdp = SessionDescription::parse(SdpType::Answer, &remote_sdp_str)
+        .expect("failed to parse remote sdp");
+    pc.set_remote_description(remote_sdp)
+        .await
+        .expect("failed to set remote description");
 
     let file = File::open("examples/static/output.ivf").expect("failed to open output.ivf");
     let reader = BufReader::new(file);
@@ -48,23 +71,17 @@ async fn main() {
     let source = Box::new(IvfSource::new(ivf, ivf_header, 0, last_timestamp.clone()));
 
     let mut packetizer = Packetizer::new(source, 1200, Box::new(Vp8Payloader));
-    let mut seq_no = 0u16;
-    let ssrc = 12345;
 
     loop {
         match packetizer.next_sample().await {
             Ok(sample) => {
-                let packet = sample.into_rtp_packet(ssrc, 90000, 96, &mut seq_no);
-                let data = packet.marshal().unwrap();
-                if let Err(e) = socket.send(&data).await {
-                    eprintln!("Failed to send packet: {}", e);
+                if let Err(e) = sample_source.send(sample).await {
+                    eprintln!("Failed to send sample to track: {}", e);
+                    break;
                 }
-                // Pacing is handled by IvfSource's interval
             }
             Err(MediaError::EndOfStream) => {
-                println!("End of stream, restarting...");
-                // For simplicity in this example, we just exit or could re-open.
-                // Re-opening requires re-creating the reader.
+                println!("End of stream");
                 break;
             }
             Err(e) => {
