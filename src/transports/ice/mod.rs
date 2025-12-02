@@ -56,6 +56,8 @@ struct IceTransportInner {
     buffered_packets: std::sync::Mutex<Vec<(Vec<u8>, SocketAddr)>>,
     selected_socket: watch::Sender<Option<IceSocketWrapper>>,
     _socket_rx_keeper: watch::Receiver<Option<IceSocketWrapper>>,
+    selected_pair_notifier: watch::Sender<Option<IceCandidatePair>>,
+    _selected_pair_rx_keeper: watch::Receiver<Option<IceCandidatePair>>,
     last_received: std::sync::Mutex<Instant>,
     candidate_tx: broadcast::Sender<IceCandidate>,
     cmd_tx: mpsc::UnboundedSender<IceCommand>,
@@ -79,6 +81,7 @@ impl std::fmt::Debug for IceTransportInner {
             .field("data_receiver", &"PacketReceiver")
             .field("buffered_packets", &self.buffered_packets)
             .field("selected_socket", &self.selected_socket)
+            .field("selected_pair_notifier", &self.selected_pair_notifier)
             .field("candidate_tx", &self.candidate_tx)
             .field("cmd_tx", &self.cmd_tx)
             .finish()
@@ -269,6 +272,22 @@ impl IceTransportRunner {
                             .push(StunAttribute::Priority(pair.local.priority));
 
                         if let Ok(bytes) = msg.encode(Some(params.password.as_bytes()), true) {
+                            // Register transaction to avoid "Unmatched transaction" logs
+                            let (tx, rx) = oneshot::channel();
+                            {
+                                let mut map = inner.pending_transactions.lock().unwrap();
+                                map.insert(tx_id, tx);
+                            }
+
+                            let inner_weak = Arc::downgrade(inner);
+                            tokio::spawn(async move {
+                                let _ = timeout(Duration::from_secs(5), rx).await;
+                                if let Some(inner) = inner_weak.upgrade() {
+                                    let mut map = inner.pending_transactions.lock().unwrap();
+                                    map.remove(&tx_id);
+                                }
+                            });
+
                             let _ = socket.send_to(&bytes, pair.remote.address).await;
                         }
                     } else if inner.config.transport_mode != crate::TransportMode::WebRtc {
@@ -290,6 +309,7 @@ impl IceTransport {
         let (state_tx, state_rx) = watch::channel(IceTransportState::New);
         let (gathering_state_tx, _) = watch::channel(IceGathererState::New);
         let (selected_socket_tx, selected_socket_rx) = watch::channel(None);
+        let (selected_pair_tx, selected_pair_rx) = watch::channel(None);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let inner = IceTransportInner {
@@ -310,6 +330,8 @@ impl IceTransport {
             buffered_packets: std::sync::Mutex::new(Vec::new()),
             selected_socket: selected_socket_tx,
             _socket_rx_keeper: selected_socket_rx,
+            selected_pair_notifier: selected_pair_tx,
+            _selected_pair_rx_keeper: selected_pair_rx,
             last_received: std::sync::Mutex::new(Instant::now()),
             candidate_tx: candidate_tx.clone(),
             cmd_tx,
@@ -345,6 +367,10 @@ impl IceTransport {
 
     pub fn subscribe_selected_socket(&self) -> watch::Receiver<Option<IceSocketWrapper>> {
         self.inner.selected_socket.subscribe()
+    }
+
+    pub fn subscribe_selected_pair(&self) -> watch::Receiver<Option<IceCandidatePair>> {
+        self.inner.selected_pair_notifier.subscribe()
     }
 
     pub async fn gather_state(&self) -> IceGathererState {
@@ -419,6 +445,7 @@ impl IceTransport {
         let pair = IceCandidatePair::new(local, remote);
 
         *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
+        let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
         if let Some(socket) = resolve_socket(&self.inner, &pair).await {
             let _ = self.inner.selected_socket.send(Some(socket));
         }
@@ -443,6 +470,7 @@ impl IceTransport {
 
     pub async fn select_pair(&self, pair: IceCandidatePair) {
         *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
+        let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
         if let Some(socket) = resolve_socket(&self.inner, &pair).await {
             let _ = self.inner.selected_socket.send(Some(socket));
         }
@@ -463,7 +491,7 @@ impl IceTransport {
         } else {
             self.inner
                 .gatherer
-                .get_socket(pair.local.address)
+                .get_socket(pair.local.base_address())
                 .await
                 .map(IceSocketWrapper::Udp)
         }
@@ -554,6 +582,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                 );
                 continue;
             }
+            // Filter out Loopback -> Non-Loopback to avoid EADDRNOTAVAIL (os error 49)
+            if local.address.ip().is_loopback() && !remote.address.ip().is_loopback() {
+                continue;
+            }
             pairs.push(IceCandidatePair::new(local.clone(), remote.clone()));
         }
     }
@@ -609,11 +641,16 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     while let Some(res) = checks.next().await {
         if let Some(pair) = res {
             *inner.selected_pair.lock().unwrap() = Some(pair.clone());
+            let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
             if let Some(socket) = resolve_socket(&inner, &pair).await {
                 let _ = inner.selected_socket.send(Some(socket));
             }
             let _ = inner.state.send(IceTransportState::Connected);
             success = true;
+            debug!(
+                "ICE checks complete. Selected pair: {} -> {}",
+                pair.local.address, pair.remote.address
+            );
             break;
         }
     }
@@ -636,11 +673,11 @@ async fn resolve_socket(
             .get(&pair.local.address)
             .map(|c| IceSocketWrapper::Turn(c.clone(), pair.local.address))
     } else {
-        let socket = inner.gatherer.get_socket(pair.local.address).await;
+        let socket = inner.gatherer.get_socket(pair.local.base_address()).await;
         if socket.is_none() {
             warn!(
                 "resolve_socket: failed to find socket for {}",
-                pair.local.address
+                pair.local.base_address()
             );
         }
         socket.map(IceSocketWrapper::Udp)
@@ -778,6 +815,7 @@ async fn handle_stun_request(
                     pair.local.address, pair.remote.address
                 );
                 *inner.selected_pair.lock().unwrap() = Some(pair.clone());
+                let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
                 if let Some(socket) = resolve_socket(&inner, &pair).await {
                     let _ = inner.selected_socket.send(Some(socket));
                 }
@@ -789,6 +827,19 @@ async fn handle_stun_request(
                 );
             }
         }
+    }
+}
+
+struct TransactionGuard<'a> {
+    map: &'a std::sync::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
+    tx_id: [u8; 12],
+}
+
+impl<'a> Drop for TransactionGuard<'a> {
+    fn drop(&mut self) {
+        // debug!("TransactionGuard: dropping tx={:?}", self.tx_id);
+        let mut map = self.map.lock().unwrap();
+        map.remove(&self.tx_id);
     }
 }
 
@@ -808,6 +859,8 @@ async fn perform_binding_check(
     };
 
     let tx_id = random_bytes::<12>();
+    // debug!("perform_binding_check: starting check for {} -> {} tx={:?}", local.address, remote.address, tx_id);
+
     let mut msg = StunMessage::binding_request(tx_id, Some("rustrtc"));
     let username = format!(
         "{}:{}",
@@ -827,82 +880,118 @@ async fn perform_binding_check(
     }
     let bytes = msg.encode(Some(remote_params.password.as_bytes()), true)?;
 
-    let (tx, rx) = oneshot::channel();
+    let (tx, mut rx) = oneshot::channel();
     {
         let mut map = inner.pending_transactions.lock().unwrap();
         map.insert(tx_id, tx);
     }
 
-    if local.typ == IceCandidateType::Relay {
+    // Ensure transaction is removed when this future is dropped
+    let _guard = TransactionGuard {
+        map: &inner.pending_transactions,
+        tx_id,
+    };
+
+    let (socket, turn_client) = if local.typ == IceCandidateType::Relay {
         let gatherer = &inner.gatherer;
         let clients = gatherer.turn_clients.lock().await;
-        if let Some(client) = clients.get(&local.address) {
-            let client = client.clone();
-            drop(clients);
+        let client = clients.get(&local.address).cloned();
+        (None, client)
+    } else {
+        let socket = inner.gatherer.get_socket(local.base_address()).await;
+        (socket, None)
+    };
 
-            let (perm_bytes, perm_tx_id) = client.create_permission_packet(remote.address).await?;
+    if local.typ == IceCandidateType::Relay {
+        let client = turn_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("TURN client not found for relay candidate"))?;
 
-            let (perm_tx, perm_rx) = oneshot::channel();
-            {
+        let (perm_bytes, perm_tx_id) = client.create_permission_packet(remote.address).await?;
+
+        let (perm_tx, perm_rx) = oneshot::channel();
+        {
+            let mut map = inner.pending_transactions.lock().unwrap();
+            map.insert(perm_tx_id, perm_tx);
+        }
+
+        trace!("Sending CreatePermission to TURN server");
+        if let Err(e) = client.send(&perm_bytes).await {
+            warn!("CreatePermission send failed: {}", e);
+            return Err(e);
+        }
+
+        match timeout(inner.config.stun_timeout, perm_rx).await {
+            Ok(Ok(msg)) => {
+                if msg.class == StunClass::ErrorResponse {
+                    bail!("CreatePermission failed: {:?}", msg.error_code);
+                }
+            }
+            _ => {
                 let mut map = inner.pending_transactions.lock().unwrap();
-                map.insert(perm_tx_id, perm_tx);
+                map.remove(&perm_tx_id);
+                bail!("CreatePermission timeout");
             }
+        }
+    } else if socket.is_none() {
+        bail!("no socket found for local candidate");
+    }
 
-            trace!("Sending CreatePermission to TURN server");
-            client.send(&perm_bytes).await?;
+    let start = Instant::now();
+    let mut rto = Duration::from_millis(500);
+    let max_timeout = inner.config.stun_timeout;
 
-            match timeout(inner.config.stun_timeout, perm_rx).await {
-                Ok(Ok(msg)) => {
-                    if msg.class == StunClass::ErrorResponse {
-                        bail!("CreatePermission failed: {:?}", msg.error_code);
-                    }
-                }
-                _ => {
-                    let mut map = inner.pending_transactions.lock().unwrap();
-                    map.remove(&perm_tx_id);
-                    bail!("CreatePermission timeout");
-                }
-            }
-
+    loop {
+        if let Some(client) = &turn_client {
             trace!(
                 "Sending STUN Binding Request via TURN to {}",
                 remote.address
             );
-            client.send_indication(remote.address, &bytes).await?;
-        } else {
-            bail!("TURN client not found for relay candidate");
+            if let Err(e) = client.send_indication(remote.address, &bytes).await {
+                warn!("TURN send_indication failed: {}", e);
+                return Err(e);
+            }
+        } else if let Some(socket) = &socket {
+            trace!("Sending STUN Request to {} tx={:?}", remote.address, tx_id);
+            if let Err(e) = socket.send_to(&bytes, remote.address).await {
+                warn!("socket.send_to failed: {}", e);
+                return Err(e.into());
+            }
         }
-    } else {
-        let socket = inner
-            .gatherer
-            .get_socket(local.address)
-            .await
-            .ok_or_else(|| anyhow!("no socket found for local candidate"))?;
 
-        trace!("Sending STUN Request to {} tx={:?}", remote.address, tx_id);
-        socket.send_to(&bytes, remote.address).await?;
-    }
+        let timeout_fut = tokio::time::sleep(max_timeout.saturating_sub(start.elapsed()));
+        let rto_fut = tokio::time::sleep(rto);
 
-    let parsed = match timeout(inner.config.stun_timeout, rx).await {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(_)) => bail!("channel closed"),
-        Err(_) => {
-            let mut map = inner.pending_transactions.lock().unwrap();
-            map.remove(&tx_id);
-            bail!("timeout");
+        tokio::select! {
+            res = &mut rx => {
+                let parsed = match res {
+                    Ok(msg) => msg,
+                    Err(_) => bail!("channel closed"),
+                };
+
+                if parsed.transaction_id != tx_id {
+                    bail!("binding response transaction mismatch");
+                }
+                if parsed.method != StunMethod::Binding {
+                    bail!("unexpected STUN method in binding response");
+                }
+                if parsed.class != StunClass::SuccessResponse {
+                    bail!("binding request failed");
+                }
+                return Ok(());
+            }
+            _ = timeout_fut => {
+                bail!("timeout");
+            }
+            _ = rto_fut => {
+                if start.elapsed() >= max_timeout {
+                    continue;
+                }
+                trace!("Retransmitting STUN Request to {} tx={:?}", remote.address, tx_id);
+                rto = std::cmp::min(rto * 2, Duration::from_millis(1600));
+            }
         }
-    };
-
-    if parsed.transaction_id != tx_id {
-        bail!("binding response transaction mismatch");
     }
-    if parsed.method != StunMethod::Binding {
-        bail!("unexpected STUN method in binding response");
-    }
-    if parsed.class != StunClass::SuccessResponse {
-        bail!("binding request failed");
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -950,6 +1039,14 @@ impl IceCandidate {
             transport: "udp".into(),
             related_address: None,
             component,
+        }
+    }
+
+    pub fn base_address(&self) -> SocketAddr {
+        if self.typ == IceCandidateType::ServerReflexive {
+            self.related_address.unwrap_or(self.address)
+        } else {
+            self.address
         }
     }
 
@@ -1355,6 +1452,9 @@ impl IceGatherer {
         }
         let parsed = StunMessage::decode(&buf[..len])?;
         if let Some(mapped) = parsed.xor_mapped_address {
+            let socket = Arc::new(socket);
+            self.sockets.lock().await.push(socket.clone());
+            let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
             return Ok(Some(IceCandidate::server_reflexive(local_addr, mapped, 1)));
         }
         Ok(None)

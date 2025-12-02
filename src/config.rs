@@ -173,7 +173,7 @@ impl Default for RtcConfiguration {
             media_capabilities: None,
             disable_ipv6: false,
             ssrc_start: 10000,
-            stun_timeout: std::time::Duration::from_secs(3),
+            stun_timeout: std::time::Duration::from_secs(5),
             dtls_buffer_size: 100,
         }
     }

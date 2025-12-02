@@ -178,6 +178,7 @@ pub struct SrtpContext {
     rtp_keys: SessionKeys,
     rtcp_keys: SessionKeys,
     rtp_gcm_cipher: Option<Aes128Gcm>,
+    rtp_auth_prototype: Option<HmacSha1>,
     direction: SrtpDirection,
     rollover_counter: u32,
     last_sequence: Option<u16>,
@@ -219,12 +220,22 @@ impl SrtpContext {
             None
         };
 
+        let rtp_auth_prototype = if !rtp_keys.auth_key.is_empty() {
+            Some(
+                <HmacSha1 as Mac>::new_from_slice(&rtp_keys.auth_key)
+                    .map_err(|_| SrtpError::UnsupportedProfile)?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             ssrc,
             _profile: profile,
             rtp_keys,
             rtcp_keys,
             rtp_gcm_cipher,
+            rtp_auth_prototype,
             direction,
             rollover_counter: 0,
             last_sequence: None,
@@ -502,13 +513,16 @@ impl SrtpContext {
                 cipher.apply_keystream(&mut packet.payload);
                 Ok(())
             }
-            SrtpProfile::AeadAes128Gcm => Ok(()), // Handled in protect/unprotect
+            _ => Err(SrtpError::UnsupportedProfile),
         }
     }
 
     fn auth_tag(&self, data: &[u8], roc: u32) -> SrtpResult<Vec<u8>> {
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.rtp_keys.auth_key)
-            .map_err(|_| SrtpError::UnsupportedProfile)?;
+        let mut mac = self
+            .rtp_auth_prototype
+            .as_ref()
+            .ok_or(SrtpError::UnsupportedProfile)?
+            .clone();
         mac.update(data);
         mac.update(&roc.to_be_bytes());
         let result = mac.finalize().into_bytes();

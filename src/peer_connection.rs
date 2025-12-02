@@ -603,6 +603,7 @@ impl PeerConnection {
         &self,
         is_client: bool,
     ) -> RtcResult<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+        debug!("start_dtls: starting with is_client={}", is_client);
         let pair = self
             .inner
             .ice_transport
@@ -614,6 +615,10 @@ impl PeerConnection {
 
         // Create IceConn and register it immediately to avoid dropping packets
         let ice_conn = IceConn::new(socket_rx.clone(), pair.remote.address);
+
+        // Monitor selected pair changes to update remote address
+        let mut pair_rx = self.inner.ice_transport.subscribe_selected_pair();
+        let ice_conn_monitor = ice_conn.clone();
 
         if self.config().transport_mode != TransportMode::WebRtc {
             let rtcp_addr = {
@@ -911,12 +916,23 @@ impl PeerConnection {
                         }
                     };
 
+                    let pair_monitor = async move {
+                        while pair_rx.changed().await.is_ok() {
+                            if let Some(pair) = pair_rx.borrow().clone() {
+                                if let Ok(mut addr) = ice_conn_monitor.remote_addr.write() {
+                                    *addr = pair.remote.address;
+                                }
+                            }
+                        }
+                    };
+
                     let combined = Box::pin(async move {
                         tokio::select! {
                             _ = rtcp_loop => {},
                             _ = dtls_runner => {},
                             _ = sctp_runner => {},
                             _ = dc_listener => {},
+                            _ = pair_monitor => {},
                         }
                     });
                     return Ok(combined);
@@ -945,6 +961,15 @@ impl PeerConnection {
                 }
                 res = state_rx.changed() => {
                     if res.is_err() { break; }
+                }
+                res = pair_rx.changed() => {
+                    if res.is_ok() {
+                        if let Some(pair) = pair_rx.borrow().clone() {
+                            if let Ok(mut addr) = ice_conn_monitor.remote_addr.write() {
+                                *addr = pair.remote.address;
+                            }
+                        }
+                    }
                 }
             }
         }

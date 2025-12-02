@@ -30,7 +30,7 @@ use self::handshake::{
 };
 use self::record::{ContentType, DtlsRecord, ProtocolVersion};
 use crate::transports::ice::conn::IceConn;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 pub fn generate_certificate() -> Result<Certificate> {
     let cert = generate_simple_self_signed(vec!["localhost".to_string()])?;
@@ -493,7 +493,7 @@ impl DtlsInner {
                     }
 
                     if msg.message_seq > ctx.recv_message_seq {
-                        warn!(
+                        info!(
                             "Received out-of-order handshake message: got {}, expected {}",
                             msg.message_seq, ctx.recv_message_seq
                         );
@@ -893,7 +893,6 @@ impl DtlsInner {
             let mut hasher = Sha256::new();
             hasher.update(&ctx.handshake_messages);
             let session_hash = hasher.finalize();
-            trace!("EMS Session Hash: {:?}", session_hash);
             prf_sha256(
                 pre_master_secret,
                 b"extended master secret",
@@ -908,8 +907,6 @@ impl DtlsInner {
             Ok(ms) => ms,
             Err(_) => return Ok(()),
         };
-
-        trace!("Master secret derived: {:?}", master_secret);
 
         let keys = match expand_keys(&master_secret, cr, sr) {
             Ok(k) => k,
@@ -1049,7 +1046,6 @@ impl DtlsInner {
                     *self.state.write().await = DtlsState::Failed;
                     return Err(anyhow::anyhow!("Finished verification failed"));
                 } else {
-                    debug!("Finished verified");
                     if let Some(keys) = &ctx.session_keys {
                         let crypto = create_session_crypto(keys.clone())?;
                         let state = DtlsState::Connected(Arc::new(crypto), ctx.srtp_profile);
@@ -1381,6 +1377,14 @@ impl DtlsInner {
             extensions.extend_from_slice(&[0x00, 17]); // Type 23
             extensions.extend_from_slice(&[0x00, 0x00]); // Length 0
 
+            // Use SRTP
+            extensions.extend_from_slice(&[0x00, 0x0e]); // Type 14
+            extensions.extend_from_slice(&[0x00, 0x07]); // Length 7
+            extensions.extend_from_slice(&[0x00, 0x04]); // Profiles Length 4
+            extensions.extend_from_slice(&[0x00, 0x07]); // Profile: AEAD_AES_128_GCM
+            extensions.extend_from_slice(&[0x00, 0x01]); // Profile: AES_CM_128_HMAC_SHA1_80
+            extensions.extend_from_slice(&[0x00]); // MKI Length 0
+
             // Supported Elliptic Curves (secp256r1)
             extensions.extend_from_slice(&[0x00, 0x0a]); // Type
             extensions.extend_from_slice(&[0x00, 0x04]); // Length
@@ -1557,15 +1561,15 @@ fn prf_sha256(secret: &[u8], label: &[u8], seed: &[u8], output_length: usize) ->
     real_seed.extend_from_slice(seed);
 
     let mut a = real_seed.clone();
+    let mac_prototype = <Hmac<Sha256> as Mac>::new_from_slice(secret)
+        .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
 
     while output.len() < output_length {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
-            .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+        let mut mac = mac_prototype.clone();
         mac.update(&a);
         a = mac.finalize().into_bytes().to_vec();
 
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
-            .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+        let mut mac = mac_prototype.clone();
         mac.update(&a);
         mac.update(&real_seed);
         let block = mac.finalize().into_bytes();

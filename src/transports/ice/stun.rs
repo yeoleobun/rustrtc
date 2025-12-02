@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use crc32fast::Hasher;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -426,16 +427,9 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
 }
 
 fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for byte in data {
-        let mut x = (crc ^ (*byte as u32)) & 0xFF;
-        for _ in 0..8 {
-            let mask = -(x as i32 & 1) as u32;
-            x = (x >> 1) ^ (0xEDB8_8320 & mask);
-        }
-        crc = (crc >> 8) ^ x;
-    }
-    !crc
+    let mut hasher = Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
 }
 
 use std::fs::File;

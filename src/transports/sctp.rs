@@ -264,39 +264,6 @@ impl SctpTransport {
         (transport, runner)
     }
 
-    pub fn create_data_channel(&self, id: u16, config: DataChannelConfig) -> Arc<DataChannel> {
-        let negotiated = config.negotiated.is_some();
-        let dc = Arc::new(DataChannel::new(id, config));
-        self.inner
-            .data_channels
-            .lock()
-            .unwrap()
-            .push(Arc::downgrade(&dc));
-
-        if !negotiated {
-            let inner = self.inner.clone();
-            let dc_clone = dc.clone();
-            tokio::spawn(async move {
-                // Wait for SCTP to be connected before sending DCEP OPEN?
-                // Or just send it and let it queue?
-                // Ideally we should wait.
-                // For now, let's just try to send.
-                if let Err(e) = inner.send_dcep_open(&dc_clone).await {
-                    warn!("Failed to send DCEP OPEN: {}", e);
-                }
-            });
-        } else {
-            let state = *self.inner.state.lock().unwrap();
-            if state == SctpState::Connected {
-                dc.state
-                    .store(DataChannelState::Open as usize, Ordering::SeqCst);
-                dc.send_event(DataChannelEvent::Open);
-            }
-        }
-
-        dc
-    }
-
     pub async fn send_data(&self, channel_id: u16, data: &[u8]) -> Result<()> {
         self.inner.send_data(channel_id, data).await
     }
@@ -749,6 +716,7 @@ impl SctpInner {
                     let dc = Arc::new(DataChannel::new(stream_id, config));
                     dc.state
                         .store(DataChannelState::Open as usize, Ordering::SeqCst);
+                    dc.send_event(DataChannelEvent::Open);
 
                     {
                         let mut channels = self.data_channels.lock().unwrap();

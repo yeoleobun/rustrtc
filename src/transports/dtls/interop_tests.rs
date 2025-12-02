@@ -4,6 +4,7 @@ use anyhow::Result;
 use dtls::cipher_suite::CipherSuiteId;
 use dtls::config::Config;
 use dtls::crypto::Certificate as DtlsCertificate;
+use dtls::extension::extension_use_srtp::SrtpProtectionProfile;
 use dtls::listener::listen;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,10 @@ use webrtc_util::conn::Listener;
 
 #[tokio::test]
 async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     // 1. Setup webrtc-dtls server
     // Generate certificate for webrtc-dtls
     let cert = DtlsCertificate::generate_self_signed(vec!["localhost".to_string()])?;
@@ -20,6 +25,7 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     let config = Config {
         certificates: vec![cert],
         cipher_suites: vec![CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256],
+        srtp_protection_profiles: vec![SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm],
         ..Default::default()
     };
 
@@ -76,7 +82,8 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     });
 
     let cert = generate_certificate()?;
-    let (client_dtls, mut incoming_rx, runner) = DtlsTransport::new(client_conn, cert, true, 1500).await?;
+    let (client_dtls, mut incoming_rx, runner) =
+        DtlsTransport::new(client_conn, cert, true, 1500).await?;
     tokio::spawn(runner);
 
     // Wait for handshake
@@ -98,7 +105,10 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
 
     // Receive echo
     info!("rustrtc client waiting for echo...");
-    let echo = incoming_rx.recv().await.ok_or(anyhow::anyhow!("Channel closed"))?;
+    let echo = incoming_rx
+        .recv()
+        .await
+        .ok_or(anyhow::anyhow!("Channel closed"))?;
     info!(
         "rustrtc client received: {:?}",
         String::from_utf8_lossy(&echo)
