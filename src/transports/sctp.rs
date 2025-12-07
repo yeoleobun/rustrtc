@@ -25,7 +25,7 @@ const RTO_ALPHA: f64 = 0.125;
 const RTO_BETA: f64 = 0.25;
 
 // Flow Control Constants
-const CWND_INITIAL: usize = 1400 * 10; // Start with ~10 packets
+const CWND_INITIAL: usize = 1200 * 10; // Start with ~10 packets
 
 #[derive(Debug, Clone)]
 struct ChunkRecord {
@@ -514,9 +514,9 @@ impl SctpInner {
 
                 // Reduce ssthresh and cwnd (Congestion Control - Simplified)
                 let flight_size = self.flight_size.load(Ordering::SeqCst);
-                let new_ssthresh = (flight_size / 2).max(1400 * 4);
+                let new_ssthresh = (flight_size / 2).max(1200 * 4);
                 self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-                self.cwnd.store(1400, Ordering::SeqCst); // Reset to 1 MTU on timeout (RFC 4960)
+                self.cwnd.store(1200, Ordering::SeqCst); // Reset to 1 MTU on timeout (RFC 4960)
             }
         }
 
@@ -800,12 +800,12 @@ impl SctpInner {
                     if cwnd <= ssthresh {
                         // Slow Start: cwnd += min(bytes_acked, MTU)
                         // We approximate bytes_acked as flight_size_reduction
-                        let increase = flight_size_reduction.min(1400); // Cap at MTU
+                        let increase = flight_size_reduction.min(1200); // Cap at MTU
                         self.cwnd.fetch_add(increase, Ordering::SeqCst);
                     } else {
                         // Congestion Avoidance: cwnd += MTU * MTU / cwnd
                         // We add (MTU * bytes_acked) / cwnd
-                        let increase = (1400 * flight_size_reduction) / cwnd;
+                        let increase = (1200 * flight_size_reduction) / cwnd;
                         // Ensure at least 1 byte growth if possible, but usually this is small
                         if increase > 0 {
                             self.cwnd.fetch_add(increase, Ordering::SeqCst);
@@ -1206,7 +1206,7 @@ impl SctpInner {
                 .find_map(|weak_dc| weak_dc.upgrade().filter(|dc| dc.id == channel_id))
         };
 
-        let mut max_payload_size = 1380;
+        let mut max_payload_size = 1200;
         let (_guard, ssn) = if let Some(dc) = &dc_opt {
             let guard = dc.send_lock.lock().await;
             let ssn = dc.next_ssn.fetch_add(1, Ordering::SeqCst);
@@ -1453,7 +1453,7 @@ impl DataChannel {
             ordered: config.ordered,
             max_retransmits: config.max_retransmits,
             max_packet_life_time: config.max_packet_life_time,
-            max_payload_size: config.max_payload_size.unwrap_or(1380),
+            max_payload_size: config.max_payload_size.unwrap_or(1200),
             negotiated: config.negotiated.is_some(),
             state: AtomicUsize::new(DataChannelState::Connecting as usize),
             next_ssn: AtomicU16::new(0),
