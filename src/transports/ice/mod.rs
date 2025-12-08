@@ -1020,7 +1020,9 @@ async fn perform_binding_check(
                                 match timeout(timeout_dur, bind_rx).await {
                                     Ok(Ok(msg)) => {
                                         if msg.class == StunClass::SuccessResponse {
-                                            client_clone.add_channel(remote_addr, channel_num).await;
+                                            client_clone
+                                                .add_channel(remote_addr, channel_num)
+                                                .await;
                                             debug!(
                                                 "TURN ChannelBound: {} -> {}",
                                                 remote_addr, channel_num
@@ -1030,7 +1032,8 @@ async fn perform_binding_check(
                                     _ => {
                                         // Timeout or error
                                         if let Some(inner) = inner_weak.upgrade() {
-                                            let mut map = inner.pending_transactions.lock().unwrap();
+                                            let mut map =
+                                                inner.pending_transactions.lock().unwrap();
                                             map.remove(&bind_tx_id);
                                         }
                                     }

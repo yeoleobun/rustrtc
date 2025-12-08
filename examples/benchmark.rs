@@ -700,7 +700,6 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
                 let total_msgs_clone = total_msgs.clone();
                 Box::pin(async move {
                     let done_clone2 = done_clone.clone();
-                    
                     dc2.on_message(Box::new(move |msg: DataChannelMessage| {
                         let total_bytes_clone = total_bytes_clone.clone();
                         let total_msgs_clone = total_msgs_clone.clone();
@@ -709,7 +708,6 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
                             total_msgs_clone.fetch_add(1, Ordering::Relaxed);
                         })
                     }));
-                    
                     dc2.on_close(Box::new(move || {
                         let done_clone2 = done_clone2.clone();
                         Box::pin(async move {
@@ -739,7 +737,6 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
             let tx = Arc::new(tx);
             let tx_clone = tx.clone();
-            
             pc1.on_peer_connection_state_change(Box::new(move |s: webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState| {
                 let tx_clone = tx_clone.clone();
                 Box::pin(async move {
@@ -748,7 +745,6 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
                     }
                 })
             }));
-            
             let _ = rx.recv().await;
 
             // Wait for open
@@ -775,7 +771,6 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
 
             pc1.close().await.unwrap();
             pc2.close().await.unwrap();
-            
             done.notified().await;
             pb.inc(1);
         }));

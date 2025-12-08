@@ -408,12 +408,12 @@ impl TurnClient {
         // Padding to 4 bytes (UDP only? RFC says "The ChannelData message is not padded to a 4-byte boundary")
         // Wait, RFC 5766 Section 11.5: "The ChannelData message is not padded to a 4-byte boundary"
         // BUT, if using TCP, we need framing.
-        
+
         let mut packet = Vec::with_capacity(4 + data.len());
         packet.extend_from_slice(&channel.to_be_bytes());
         packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
         packet.extend_from_slice(data);
-        
+
         self.send(&packet).await
     }
 }

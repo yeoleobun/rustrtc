@@ -297,7 +297,6 @@ impl Drop for DtlsTransport {
 impl DtlsInner {
     async fn handle_retransmit(&self, ctx: &HandshakeContext, _is_client: bool) {
         if let Some(buf) = &ctx.last_flight_buffer {
-            debug!("Retransmitting last flight (len={})", buf.len());
             if let Err(e) = self.conn.send(buf).await {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                     match io_err.kind() {
@@ -1515,7 +1514,7 @@ impl DtlsInner {
                     if let Err(e) = self.handle_incoming_packet(packet, &mut ctx, &incoming_data_tx, &certificate, is_client).await {
                         warn!("DTLS handshake loop error in handle_incoming_packet: {}", e);
                         // Do not abort handshake on packet processing error (e.g. decrypt fail, bad record)
-                        // return Err(e); 
+                        // return Err(e);
                     }
                 }
             }

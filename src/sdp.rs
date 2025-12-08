@@ -1,3 +1,4 @@
+use crate::config::RtcConfiguration;
 use crate::errors::{SdpError, SdpResult};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -38,6 +39,22 @@ impl SessionDescription {
             sdp_type,
             session: SessionSection::default(),
             media_sections: Vec::new(),
+        }
+    }
+
+    pub fn add_candidates(&mut self, candidates: &[String]) {
+        for section in &mut self.media_sections {
+            section
+                .attributes
+                .retain(|a| a.key != "candidate" && a.key != "end-of-candidates");
+            for c in candidates {
+                section
+                    .attributes
+                    .push(Attribute::new("candidate", Some(c.clone())));
+            }
+            section
+                .attributes
+                .push(Attribute::new("end-of-candidates", None));
         }
     }
 
@@ -528,6 +545,124 @@ impl MediaSection {
     pub fn attribute(mut self, key: impl Into<String>, value: Option<String>) -> Self {
         self.attributes.push(Attribute::new(key, value));
         self
+    }
+
+    pub fn apply_config(&mut self, config: &RtcConfiguration) {
+        match self.kind {
+            MediaKind::Audio => self.apply_audio_config(config),
+            MediaKind::Video => self.apply_video_config(config),
+            MediaKind::Application => self.apply_application_config(config),
+        }
+    }
+
+    fn apply_audio_config(&mut self, config: &RtcConfiguration) {
+        let default_caps = crate::config::AudioCapability::default();
+        let caps = if let Some(c) = &config.media_capabilities {
+            if c.audio.is_empty() {
+                vec![default_caps]
+            } else {
+                c.audio.clone()
+            }
+        } else {
+            vec![default_caps]
+        };
+
+        self.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
+        self.attributes.push(Attribute::new("rtcp-mux", None));
+        for audio in &caps {
+            self.attributes.push(Attribute::new(
+                "rtpmap",
+                Some(format!(
+                    "{} {}/{}/{}",
+                    audio.payload_type, audio.codec_name, audio.clock_rate, audio.channels
+                )),
+            ));
+            if let Some(fmtp) = &audio.fmtp {
+                self.attributes.push(Attribute::new(
+                    "fmtp",
+                    Some(format!("{} {}", audio.payload_type, fmtp)),
+                ));
+            }
+        }
+    }
+
+    fn apply_video_config(&mut self, config: &RtcConfiguration) {
+        let default_caps = crate::config::VideoCapability::default();
+        let caps = if let Some(c) = &config.media_capabilities {
+            if c.video.is_empty() {
+                vec![default_caps]
+            } else {
+                c.video.clone()
+            }
+        } else {
+            vec![default_caps]
+        };
+
+        self.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
+        self.attributes.push(Attribute::new("rtcp-mux", None));
+        for video in &caps {
+            self.attributes.push(Attribute::new(
+                "rtpmap",
+                Some(format!(
+                    "{} {}/{}",
+                    video.payload_type, video.codec_name, video.clock_rate
+                )),
+            ));
+            for fb in &video.rtcp_fbs {
+                self.attributes.push(Attribute::new(
+                    "rtcp-fb",
+                    Some(format!("{} {}", video.payload_type, fb)),
+                ));
+            }
+        }
+    }
+
+    fn apply_application_config(&mut self, config: &RtcConfiguration) {
+        let default_caps = crate::config::ApplicationCapability::default();
+        let port = if let Some(caps) = &config.media_capabilities {
+            if let Some(app) = &caps.application {
+                app.sctp_port
+            } else {
+                default_caps.sctp_port
+            }
+        } else {
+            default_caps.sctp_port
+        };
+
+        self.protocol = "UDP/DTLS/SCTP".into();
+        self.formats = vec!["webrtc-datachannel".into()];
+        self.attributes
+            .push(Attribute::new("sctp-port", Some(port.to_string())));
+    }
+
+    pub fn add_dtls_attributes(&mut self, fingerprint_hash: &str, setup: &str) {
+        self.attributes.push(Attribute::new(
+            "fingerprint",
+            Some(format!("sha-256 {}", fingerprint_hash)),
+        ));
+        self.attributes
+            .push(Attribute::new("setup", Some(setup.to_string())));
+    }
+
+    pub fn add_video_extmaps(&mut self, rid_id: Option<String>, repaired_rid_id: Option<String>) {
+        if let Some(id) = rid_id {
+            self.attributes.push(Attribute::new(
+                "extmap",
+                Some(format!(
+                    "{} urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id",
+                    id
+                )),
+            ));
+        }
+        if let Some(id) = repaired_rid_id {
+            self.attributes.push(Attribute::new(
+                "extmap",
+                Some(format!(
+                    "{} urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
+                    id
+                )),
+            ));
+        }
     }
 
     fn from_m_line(value: &str) -> SdpResult<Self> {
