@@ -1214,69 +1214,51 @@ async fn run_gathering_loop(
     let mut ice_state_rx = ice_transport.subscribe_state();
     loop {
         let state = *rx.borrow_and_update();
+        if state == crate::transports::ice::IceGathererState::Complete {
+            if let Some(inner) = inner_weak.upgrade() {
+                let update_local_description = || {
+                    if inner.config.transport_mode == TransportMode::WebRtc {
+                        let candidates = ice_transport.local_candidates();
+                        let candidate_strs: Vec<String> =
+                            candidates.iter().map(|c| c.to_sdp()).collect();
+
+                        let mut local_guard = inner.local_description.lock().unwrap();
+                        if let Some(desc) = local_guard.as_mut() {
+                            desc.add_candidates(&candidate_strs);
+                            return true;
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                };
+
+                if !update_local_description() {
+                    let mut sig_rx = inner.signaling_state.subscribe();
+                    loop {
+                        if update_local_description() {
+                            break;
+                        }
+                        if sig_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let pc_state = match state {
             crate::transports::ice::IceGathererState::New => IceGatheringState::New,
             crate::transports::ice::IceGathererState::Gathering => IceGatheringState::Gathering,
             crate::transports::ice::IceGathererState::Complete => IceGatheringState::Complete,
         };
+
         if ice_gathering_state_tx.send(pc_state).is_err() {
             break;
         }
         if state == crate::transports::ice::IceGathererState::Complete {
-            if let Some(inner) = inner_weak.upgrade() {
-                let mut updated = false;
-                if inner.config.transport_mode == TransportMode::WebRtc {
-                    let candidates = ice_transport.local_candidates();
-                    let candidate_strs: Vec<String> =
-                        candidates.iter().map(|c| c.to_sdp()).collect();
-
-                    let mut local_guard = inner.local_description.lock().unwrap();
-                    if let Some(desc) = local_guard.as_mut() {
-                        desc.add_candidates(&candidate_strs);
-                        updated = true;
-                    }
-                } else {
-                    updated = true;
-                }
-
-                if !updated {
-                    let inner_weak_2 = inner_weak.clone();
-                    let ice_transport_2 = ice_transport.clone();
-
-                    if let Some(inner) = inner_weak_2.upgrade() {
-                        let mut sig_rx = inner.signaling_state.subscribe();
-                        loop {
-                            let mut done = false;
-                            if inner.config.transport_mode == TransportMode::WebRtc {
-                                let is_some = inner.local_description.lock().unwrap().is_some();
-                                if is_some {
-                                    let candidates = ice_transport_2.local_candidates();
-                                    let candidate_strs: Vec<String> =
-                                        candidates.iter().map(|c| c.to_sdp()).collect();
-
-                                    let mut local_guard = inner.local_description.lock().unwrap();
-                                    if let Some(desc) = local_guard.as_mut() {
-                                        desc.add_candidates(&candidate_strs);
-                                        done = true;
-                                    }
-                                }
-                            } else {
-                                done = true;
-                            }
-
-                            if done {
-                                break;
-                            }
-                            if sig_rx.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
             break;
         }
-
         tokio::select! {
             res = rx.changed() => {
                 if res.is_err() { break; }

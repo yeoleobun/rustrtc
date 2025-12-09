@@ -1055,16 +1055,17 @@ async fn perform_binding_check(
 
     loop {
         if let Some(client) = &turn_client {
-            trace!(
-                "Sending STUN Binding Request via TURN to {}",
-                remote.address
-            );
-            if let Err(e) = client.send_indication(remote.address, &bytes).await {
-                warn!("TURN send_indication failed: {}", e);
+            let sent = if let Some(channel) = client.get_channel(remote.address).await {
+                client.send_channel_data(channel, &bytes).await
+            } else {
+                client.send_indication(remote.address, &bytes).await
+            };
+
+            if let Err(e) = sent {
+                debug!("TURN send failed: {}", e);
                 return Err(e);
             }
         } else if let Some(socket) = &socket {
-            trace!("Sending STUN Request to {} tx={:?}", remote.address, tx_id);
             if let Err(e) = socket.send_to(&bytes, remote.address).await {
                 match e.kind() {
                     std::io::ErrorKind::HostUnreachable
