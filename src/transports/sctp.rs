@@ -2,8 +2,8 @@ use crate::transports::dtls::{DtlsState, DtlsTransport};
 use crate::transports::ice::stun::random_u32;
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
@@ -32,6 +32,7 @@ struct ChunkRecord {
     payload: Bytes,
     sent_time: Instant,
     transmit_count: u32,
+    missing_reports: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +181,8 @@ impl From<usize> for DataChannelState {
 // SCTP Constants
 const SCTP_COMMON_HEADER_SIZE: usize = 12;
 const CHUNK_HEADER_SIZE: usize = 4;
+const LOCAL_RWND_BYTES: usize = 1024 * 1024;
+const DUP_THRESH: u8 = 3;
 
 // Chunk Types
 const CT_DATA: u8 = 0;
@@ -257,6 +260,11 @@ struct SctpInner {
     peer_rwnd: AtomicU32, // Peer's Advertised Receiver Window
     timer_notify: Arc<Notify>,
     flow_control_notify: Arc<Notify>,
+    ack_delay_ms: AtomicU32,
+    ack_scheduled: AtomicBool,
+    last_gap_sig: AtomicU32,
+    dups_buffer: Mutex<Vec<u32>>, // duplicate TSNs to include in next SACK
+    last_immediate_sack: Mutex<Option<Instant>>, // throttle immediate SACKs
 }
 
 struct SctpCleanupGuard<'a> {
@@ -312,6 +320,84 @@ fn build_gap_ack_blocks_from_map(
     }
 
     blocks
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct SackOutcome {
+    flight_reduction: usize,
+    rtt_samples: Vec<f64>,
+    retransmit: Vec<(u32, Bytes)>,
+    head_moved: bool,
+}
+
+fn apply_sack_to_sent_queue(
+    sent_queue: &mut BTreeMap<u32, ChunkRecord>,
+    cumulative_tsn_ack: u32,
+    gap_blocks: &[(u16, u16)],
+    now: Instant,
+) -> SackOutcome {
+    let before_head = sent_queue.keys().next().cloned();
+
+    let mut max_reported = cumulative_tsn_ack;
+    for (_start, end) in gap_blocks {
+        let block_end = cumulative_tsn_ack.wrapping_add(*end as u32);
+        if block_end > max_reported {
+            max_reported = block_end;
+        }
+    }
+
+    let mut outcome = SackOutcome::default();
+
+    // Remove everything that the SACK explicitly acknowledges.
+    let mut to_remove = Vec::new();
+    for (&tsn, record) in sent_queue.iter() {
+        let gap_acked = gap_blocks.iter().any(|(start, end)| {
+            let s = cumulative_tsn_ack.wrapping_add(*start as u32);
+            let e = cumulative_tsn_ack.wrapping_add(*end as u32);
+            tsn >= s && tsn <= e
+        });
+
+        if tsn <= cumulative_tsn_ack || gap_acked {
+            outcome.flight_reduction += record.payload.len();
+            if record.transmit_count == 0 {
+                outcome
+                    .rtt_samples
+                    .push(now.duration_since(record.sent_time).as_secs_f64());
+            }
+            to_remove.push(tsn);
+        }
+    }
+
+    for tsn in to_remove {
+        sent_queue.remove(&tsn);
+    }
+
+    // Mark missing reports and schedule fast retransmits.
+    for (&tsn, record) in sent_queue.iter_mut() {
+        let gap_acked = gap_blocks.iter().any(|(start, end)| {
+            let s = cumulative_tsn_ack.wrapping_add(*start as u32);
+            let e = cumulative_tsn_ack.wrapping_add(*end as u32);
+            tsn >= s && tsn <= e
+        });
+
+        if tsn <= max_reported && tsn > cumulative_tsn_ack && !gap_acked {
+            record.missing_reports = record.missing_reports.saturating_add(1);
+        } else {
+            record.missing_reports = 0;
+        }
+
+        if record.missing_reports >= DUP_THRESH {
+            record.missing_reports = 0;
+            record.transmit_count += 1;
+            record.sent_time = now;
+            outcome.retransmit.push((tsn, record.payload.clone()));
+        }
+    }
+
+    let after_head = sent_queue.keys().next().cloned();
+    outcome.head_moved = before_head != after_head;
+
+    outcome
 }
 
 impl<'a> Drop for SctpCleanupGuard<'a> {
@@ -373,6 +459,11 @@ impl SctpTransport {
             peer_rwnd: AtomicU32::new(1024 * 1024), // Default 1MB until we hear otherwise
             timer_notify: Arc::new(Notify::new()),
             flow_control_notify: Arc::new(Notify::new()),
+            ack_delay_ms: AtomicU32::new(200),
+            ack_scheduled: AtomicBool::new(false),
+            last_gap_sig: AtomicU32::new(0),
+            dups_buffer: Mutex::new(Vec::new()),
+            last_immediate_sack: Mutex::new(None),
         });
 
         let close_tx = Arc::new(tokio::sync::Notify::new());
@@ -415,6 +506,29 @@ impl Drop for SctpTransport {
 }
 
 impl SctpInner {
+    fn compute_ack_delay_ms(&self, has_gap: bool) -> u32 {
+        if !has_gap {
+            return 200;
+        }
+        let srtt = self.rto_state.lock().unwrap().srtt;
+        if srtt == 0.0 {
+            return 50;
+        }
+        let ms = (srtt * 1000.0 * 0.25).round() as u32;
+        ms.clamp(20, 200)
+    }
+
+    fn gap_signature(&self, cumulative_tsn_ack: u32) -> u32 {
+        let blocks = self.build_gap_ack_blocks(cumulative_tsn_ack);
+        let mut sig: u32 = 0x9E37_79B9; // golden ratio constant seed
+        for (s, e) in blocks {
+            let pair = ((s as u32) << 16) | (e as u32);
+            // mix
+            sig = sig.wrapping_add(pair ^ (pair.rotate_left(13)));
+            sig ^= sig.rotate_left(7);
+        }
+        sig
+    }
     async fn run_loop(
         &self,
         close_rx: Arc<tokio::sync::Notify>,
@@ -473,7 +587,8 @@ impl SctpInner {
             // 2. Calculate SACK Timeout
             let sack_timeout = if self.sack_counter.load(Ordering::Relaxed) > 0 {
                 if sack_deadline.is_none() {
-                    sack_deadline = Some(now + Duration::from_millis(200));
+                    let delay = self.ack_delay_ms.load(Ordering::Relaxed);
+                    sack_deadline = Some(now + Duration::from_millis(delay as u64));
                 }
                 let deadline = sack_deadline.unwrap();
                 if deadline > now {
@@ -508,6 +623,7 @@ impl SctpInner {
                                     warn!("Failed to send Delayed SACK: {}", e);
                                 }
                                 self.sack_counter.store(0, Ordering::Relaxed);
+                                self.ack_scheduled.store(false, Ordering::Relaxed);
                             }
                             sack_deadline = None;
                         }
@@ -547,35 +663,39 @@ impl SctpInner {
     async fn handle_timeout(&self) -> Result<()> {
         let mut to_retransmit = Vec::new();
 
-        // 1. Check what needs retransmission
+        // 1. Collect all expired chunks and backoff RTO once
+        let now = Instant::now();
+        let rto = { self.rto_state.lock().unwrap().rto };
         {
             let mut sent_queue = self.sent_queue.lock().unwrap();
-            if let Some((tsn, record)) = sent_queue.iter_mut().next() {
-                // Double RTO (Backoff)
-                let mut rto_state = self.rto_state.lock().unwrap();
-                rto_state.backoff();
-                debug!(
-                    "T3-RTX Timeout! Retransmitting TSN {}, New RTO: {}",
-                    tsn, rto_state.rto
-                );
-
-                record.transmit_count += 1;
-                // Don't update sent_time for retransmissions to avoid RTT pollution?
-                // Actually, we restart the timer, so we treat it as "sent now" for timer purposes,
-                // but we MUST NOT use it for RTT calculation (Karn's Algorithm).
-                record.sent_time = Instant::now();
-
-                to_retransmit.push((*tsn, record.payload.clone()));
-
-                // Reduce ssthresh and cwnd (Congestion Control - Simplified)
-                let flight_size = self.flight_size.load(Ordering::SeqCst);
-                let new_ssthresh = (flight_size / 2).max(1200 * 4);
-                self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-                self.cwnd.store(1200, Ordering::SeqCst); // Reset to 1 MTU on timeout (RFC 4960)
+            for (tsn, record) in sent_queue.iter_mut() {
+                let expiry = record.sent_time + Duration::from_secs_f64(rto);
+                if now >= expiry {
+                    to_retransmit.push((*tsn, record.payload.clone()));
+                    record.transmit_count += 1;
+                    record.sent_time = now; // restart timer; don't sample RTT on retransmit
+                }
             }
         }
 
-        // 2. Retransmit
+        if !to_retransmit.is_empty() {
+            // Backoff RTO once per timer tick
+            let mut rto_state = self.rto_state.lock().unwrap();
+            rto_state.backoff();
+            debug!(
+                "T3-RTX Timeout! Retransmitting {} chunks, New RTO: {}",
+                to_retransmit.len(),
+                rto_state.rto
+            );
+
+            // Reduce ssthresh and cwnd (Simplified)
+            let flight_size = self.flight_size.load(Ordering::SeqCst);
+            let new_ssthresh = (flight_size / 2).max(1200 * 4);
+            self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
+            self.cwnd.store(1200, Ordering::SeqCst);
+        }
+
+        // 2. Retransmit expired chunks
         for (tsn, data) in to_retransmit {
             if let Err(e) = self.dtls_transport.send(data).await {
                 warn!("Failed to retransmit TSN {}: {}", tsn, e);
@@ -821,94 +941,54 @@ impl SctpInner {
             let _num_duplicate_tsns = buf.get_u16();
 
             self.peer_rwnd.store(a_rwnd, Ordering::SeqCst);
-
-            // 1. Remove acknowledged packets
-            {
-                let mut sent_queue = self.sent_queue.lock().unwrap();
-                // split_off returns keys >= cumulative_tsn_ack + 1.
-                // So we keep the remaining (unacked) part in `remaining`.
-                // The original `sent_queue` retains the acked part.
-                let remaining = sent_queue.split_off(&(cumulative_tsn_ack + 1));
-                let acked = std::mem::replace(&mut *sent_queue, remaining);
-
-                let mut flight_size_reduction = 0;
-                let now = Instant::now();
-
-                for (_, record) in acked {
-                    flight_size_reduction += record.payload.len();
-
-                    // Karn's Algorithm: Only measure RTT for packets sent once
-                    if record.transmit_count == 0 {
-                        let rtt = now.duration_since(record.sent_time).as_secs_f64();
-                        self.update_rto(rtt);
-                    }
+            let mut gap_blocks = Vec::new();
+            for _ in 0..num_gap_ack_blocks {
+                if buf.remaining() < 4 {
+                    break;
                 }
-
-                if flight_size_reduction > 0 {
-                    self.flight_size
-                        .fetch_sub(flight_size_reduction, Ordering::SeqCst);
-
-                    // Congestion Control: Update cwnd
-                    let cwnd = self.cwnd.load(Ordering::SeqCst);
-                    let ssthresh = self.ssthresh.load(Ordering::SeqCst);
-
-                    if cwnd <= ssthresh {
-                        // Slow Start: cwnd += min(bytes_acked, MTU)
-                        // We approximate bytes_acked as flight_size_reduction
-                        let increase = flight_size_reduction.min(1200); // Cap at MTU
-                        self.cwnd.fetch_add(increase, Ordering::SeqCst);
-                    } else {
-                        // Congestion Avoidance: cwnd += MTU * MTU / cwnd
-                        // We add (MTU * bytes_acked) / cwnd
-                        let increase = (1200 * flight_size_reduction) / cwnd;
-                        // Ensure at least 1 byte growth if possible, but usually this is small
-                        if increase > 0 {
-                            self.cwnd.fetch_add(increase, Ordering::SeqCst);
-                        }
-                    }
-
-                    self.flow_control_notify.notify_waiters();
-                }
+                gap_blocks.push((buf.get_u16(), buf.get_u16()));
             }
 
-            if num_gap_ack_blocks > 0 {
-                let mut max_sack_tsn = cumulative_tsn_ack;
-                let mut received_tsns = HashSet::new();
+            let now = Instant::now();
+            let outcome = {
+                let mut sent_queue = self.sent_queue.lock().unwrap();
+                apply_sack_to_sent_queue(&mut *sent_queue, cumulative_tsn_ack, &gap_blocks, now)
+            };
 
-                for _ in 0..num_gap_ack_blocks {
-                    if buf.remaining() < 4 {
-                        break;
-                    }
-                    let start = buf.get_u16();
-                    let end = buf.get_u16();
-                    let block_start = cumulative_tsn_ack.wrapping_add(start as u32);
-                    let block_end = cumulative_tsn_ack.wrapping_add(end as u32);
+            for rtt in outcome.rtt_samples {
+                self.update_rto(rtt);
+            }
 
-                    if block_end > max_sack_tsn {
-                        max_sack_tsn = block_end;
-                    }
+            if outcome.flight_reduction > 0 {
+                self.flight_size
+                    .fetch_sub(outcome.flight_reduction, Ordering::SeqCst);
 
-                    for tsn in block_start..=block_end {
-                        received_tsns.insert(tsn);
-                    }
-                }
+                // Congestion Control: Update cwnd
+                let cwnd = self.cwnd.load(Ordering::SeqCst);
+                let ssthresh = self.ssthresh.load(Ordering::SeqCst);
 
-                let mut to_retransmit = Vec::new();
-                {
-                    let mut sent_queue = self.sent_queue.lock().unwrap();
-                    for (&tsn, record) in sent_queue.iter_mut() {
-                        if tsn <= max_sack_tsn && !received_tsns.contains(&tsn) {
-                            // Fast Retransmit
-                            record.transmit_count += 1;
-                            to_retransmit.push((tsn, record.payload.clone()));
-                        }
+                if cwnd <= ssthresh {
+                    // Slow Start: cwnd += min(bytes_acked, MTU)
+                    let increase = outcome.flight_reduction.min(1200);
+                    self.cwnd.fetch_add(increase, Ordering::SeqCst);
+                } else {
+                    // Congestion Avoidance: cwnd += (MTU * bytes_acked) / cwnd
+                    let increase = (1200 * outcome.flight_reduction) / cwnd;
+                    if increase > 0 {
+                        self.cwnd.fetch_add(increase, Ordering::SeqCst);
                     }
                 }
 
-                for (tsn, data) in to_retransmit {
-                    if let Err(e) = self.dtls_transport.send(data).await {
-                        warn!("Failed to retransmit TSN {}: {}", tsn, e);
-                    }
+                self.flow_control_notify.notify_waiters();
+            }
+
+            if outcome.head_moved {
+                self.timer_notify.notify_one();
+            }
+
+            for (tsn, data) in outcome.retransmit {
+                if let Err(e) = self.dtls_transport.send(data).await {
+                    warn!("Failed to retransmit TSN {}: {}", tsn, e);
                 }
             }
         }
@@ -975,9 +1055,23 @@ impl SctpInner {
         let diff = tsn.wrapping_sub(cumulative_ack);
 
         if diff == 0 || diff > 0x80000000 {
-            // Duplicate or Old
-            let ack = self.cumulative_tsn_ack.load(Ordering::SeqCst);
-            self.send_sack(ack).await?;
+            // Duplicate or Old: record duplicate and schedule fast SACK
+            {
+                let mut dups = self.dups_buffer.lock().unwrap();
+                if dups.len() < 32 {
+                    dups.push(tsn);
+                }
+            }
+            let delay = self.compute_ack_delay_ms(true);
+            self.ack_delay_ms.store(delay, Ordering::Relaxed);
+            if self
+                .ack_scheduled
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.sack_counter.store(1, Ordering::Relaxed);
+                self.timer_notify.notify_one();
+            }
             return Ok(());
         }
 
@@ -1018,17 +1112,66 @@ impl SctpInner {
         let has_gap = !self.received_queue.lock().unwrap().is_empty();
 
         if has_gap {
-            warn!("Gap detected! Cumulative ACK: {}. Sending SACK.", ack);
-            self.send_sack(ack).await?;
+            // Prefer quick delayed ack when gaps exist
+            let delay = self.compute_ack_delay_ms(true);
+            self.ack_delay_ms.store(delay, Ordering::Relaxed);
+            // If the gap pattern changed, send an immediate SACK once
+            let sig = self.gap_signature(ack);
+            let prev = self.last_gap_sig.swap(sig, Ordering::Relaxed);
+            if sig != prev {
+                // Throttle immediate SACKs to avoid spamming; use RTT-based minimum interval
+                let min_ms = self.compute_ack_delay_ms(true);
+                let now = Instant::now();
+                let allow_immediate = {
+                    let last = self.last_immediate_sack.lock().unwrap();
+                    match *last {
+                        Some(t) => now.duration_since(t) >= Duration::from_millis(min_ms as u64),
+                        None => true,
+                    }
+                };
+                if allow_immediate {
+                    debug!("Gap changed. Immediate SACK; cum_ack={}.", ack);
+                    self.send_sack(ack).await?;
+                    self.ack_scheduled.store(false, Ordering::Relaxed);
+                    self.sack_counter.store(0, Ordering::Relaxed);
+                    {
+                        let mut last = self.last_immediate_sack.lock().unwrap();
+                        *last = Some(now);
+                    }
+                } else if self
+                    .ack_scheduled
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    debug!(
+                        "Gap detected. Cumulative ACK: {}. Scheduling delayed SACK.",
+                        ack
+                    );
+                    self.sack_counter.store(1, Ordering::Relaxed);
+                    self.timer_notify.notify_one();
+                }
+            } else if self
+                .ack_scheduled
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                debug!(
+                    "Gap detected. Cumulative ACK: {}. Scheduling delayed SACK.",
+                    ack
+                );
+                self.sack_counter.store(1, Ordering::Relaxed);
+                self.timer_notify.notify_one();
+            }
         } else {
-            // Delayed Ack logic (RFC 4960)
-            // Send SACK every 2 packets
+            // Restore normal delayed ack timing
+            self.ack_delay_ms.store(200, Ordering::Relaxed);
+            // Delayed Ack logic (RFC 4960): send SACK every 2 packets
             let count = self.sack_counter.fetch_add(1, Ordering::Relaxed);
             if count >= 1 {
                 self.sack_counter.store(0, Ordering::Relaxed);
                 self.send_sack(ack).await?;
             }
-            // If count was 0, it is now 1. The run_loop will pick this up and set the 200ms timer.
+            // If count was 0, it is now 1. The run_loop will pick this up and set the timer.
         }
         Ok(())
     }
@@ -1194,17 +1337,53 @@ impl SctpInner {
         build_gap_ack_blocks_from_map(&received, cumulative_tsn_ack)
     }
 
+    fn advertised_rwnd(&self) -> u32 {
+        let mut used: usize = 0;
+        {
+            let received = self.received_queue.lock().unwrap();
+            used += received
+                .values()
+                .map(|(_, bytes)| bytes.len())
+                .sum::<usize>();
+        }
+
+        {
+            let channels = self.data_channels.lock().unwrap();
+            for weak_dc in channels.iter() {
+                if let Some(dc) = weak_dc.upgrade() {
+                    used += dc.reassembly_buffer.lock().unwrap().len();
+                }
+            }
+        }
+
+        LOCAL_RWND_BYTES
+            .saturating_sub(used)
+            .try_into()
+            .unwrap_or(0)
+    }
+
     async fn send_sack(&self, cumulative_tsn_ack: u32) -> Result<()> {
         let mut sack = BytesMut::new();
         sack.put_u32(cumulative_tsn_ack); // Cumulative TSN Ack
-        sack.put_u32(1024 * 1024); // a_rwnd
+        sack.put_u32(self.advertised_rwnd()); // a_rwnd reflects buffered state
         let gap_blocks = self.build_gap_ack_blocks(cumulative_tsn_ack);
+        let dups = {
+            let mut d = self.dups_buffer.lock().unwrap();
+            let mut out = Vec::new();
+            while !d.is_empty() && out.len() < 32 {
+                out.push(d.remove(0));
+            }
+            out
+        };
         sack.put_u16(gap_blocks.len() as u16); // Number of Gap Ack Blocks
-        sack.put_u16(0); // Number of Duplicate TSNs (not tracked yet)
+        sack.put_u16(dups.len() as u16); // Number of Duplicate TSNs
 
         for (start, end) in &gap_blocks {
             sack.put_u16(*start);
             sack.put_u16(*end);
+        }
+        for tsn in dups {
+            sack.put_u32(tsn);
         }
 
         let tag = self.remote_verification_tag.load(Ordering::SeqCst);
@@ -1326,6 +1505,7 @@ impl SctpInner {
                     payload: packet.clone(),
                     sent_time: Instant::now(),
                     transmit_count: 0,
+                    missing_reports: 0,
                 };
                 queue.insert(tsn, record);
                 self.flight_size.fetch_add(packet.len(), Ordering::SeqCst);
@@ -1415,6 +1595,7 @@ impl SctpInner {
                         payload: packet.clone(),
                         sent_time: now,
                         transmit_count: 0,
+                        missing_reports: 0,
                     };
                     queue.insert(*tsn, record);
                 }
@@ -1601,6 +1782,7 @@ impl DataChannel {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     #[test]
     fn test_rto_calculator() {
@@ -1680,5 +1862,83 @@ mod tests {
 
         let blocks = build_gap_ack_blocks_from_map(&received, 6);
         assert_eq!(blocks, vec![(2, 3)]);
+    }
+
+    #[test]
+    fn test_apply_sack_removes_gaps_and_tracks_rtt() {
+        let mut sent: BTreeMap<u32, ChunkRecord> = BTreeMap::new();
+        let base = Instant::now() - Duration::from_millis(100);
+        sent.insert(
+            10,
+            ChunkRecord {
+                payload: Bytes::from_static(b"a"),
+                sent_time: base,
+                transmit_count: 0,
+                missing_reports: 0,
+            },
+        );
+        sent.insert(
+            11,
+            ChunkRecord {
+                payload: Bytes::from_static(b"b"),
+                sent_time: base,
+                transmit_count: 0,
+                missing_reports: 0,
+            },
+        );
+        sent.insert(
+            12,
+            ChunkRecord {
+                payload: Bytes::from_static(b"c"),
+                sent_time: base,
+                transmit_count: 0,
+                missing_reports: 0,
+            },
+        );
+
+        // Ack cumulative 10 and gap-ack 12, leaving 11 outstanding.
+        let outcome = apply_sack_to_sent_queue(&mut sent, 10, &[(2, 2)], Instant::now());
+
+        assert_eq!(outcome.flight_reduction, 2); // a + c removed
+        assert_eq!(outcome.rtt_samples.len(), 2);
+        assert!(outcome.retransmit.is_empty());
+        assert!(outcome.head_moved); // head advanced from 10 to 11
+
+        assert_eq!(sent.len(), 1);
+        assert!(sent.contains_key(&11));
+    }
+
+    #[test]
+    fn test_fast_retransmit_after_dup_thresh() {
+        let mut sent: BTreeMap<u32, ChunkRecord> = BTreeMap::new();
+        let base = Instant::now() - Duration::from_millis(50);
+        for tsn in 21..=23 {
+            sent.insert(
+                tsn,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"p"),
+                    sent_time: base,
+                    transmit_count: 0,
+                    missing_reports: 0,
+                },
+            );
+        }
+
+        // Repeated SACKs report up to TSN 23 but never ack TSN 22.
+        let sack_gap = [(2u16, 2u16)];
+        let mut outcome;
+
+        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now());
+        assert_eq!(outcome.retransmit.len(), 0);
+        assert_eq!(sent.len(), 1); // 21 and 23 acked
+
+        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now());
+        assert_eq!(outcome.retransmit.len(), 0);
+
+        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now());
+        assert_eq!(outcome.retransmit.len(), 1);
+        assert_eq!(outcome.retransmit[0].0, 22);
+        let rec = sent.get(&22).unwrap();
+        assert_eq!(rec.missing_reports, 0);
     }
 }
