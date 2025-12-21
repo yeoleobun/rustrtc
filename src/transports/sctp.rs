@@ -1,7 +1,7 @@
+use crate::RtcConfiguration;
 pub use crate::transports::datachannel::*;
 use crate::transports::dtls::{DtlsState, DtlsTransport};
 use crate::transports::ice::stun::random_u32;
-use crate::RtcConfiguration;
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::BTreeMap;
@@ -689,16 +689,24 @@ impl SctpInner {
                         }
                     } else {
                         // Check for association-wide retransmission limit
-                        if record.transmit_count >= self.max_association_retransmits && self.max_association_retransmits > 0 {
-                            warn!("SCTP Association retransmission limit reached ({}), closing", self.max_association_retransmits);
+                        if record.transmit_count >= self.max_association_retransmits
+                            && self.max_association_retransmits > 0
+                        {
+                            warn!(
+                                "SCTP Association retransmission limit reached ({}), closing",
+                                self.max_association_retransmits
+                            );
                             self.set_state(SctpState::Closed);
                             return Ok(());
                         }
 
                         // RFC 4960 Section 6.3.3: Retransmit only the earliest outstanding DATA chunks
                         // that fit into a single packet of size MTU.
-                        let current_len: usize = to_retransmit.iter().map(|(_, p): &(u32, Bytes)| p.len()).sum();
-                        if current_len + record.payload.len() < DEFAULT_MAX_PAYLOAD_SIZE {
+                        let current_len: usize = to_retransmit
+                            .iter()
+                            .map(|(_, p): &(u32, Bytes)| p.len())
+                            .sum();
+                        if current_len + record.payload.len() < DEFAULT_MAX_PAYLOAD_SIZE * 4 {
                             to_retransmit.push((*tsn, record.payload.clone()));
                             record.transmit_count += 1;
                             record.sent_time = now; // restart timer; don't sample RTT on retransmit
@@ -728,7 +736,7 @@ impl SctpInner {
             let cwnd = self.cwnd.load(Ordering::SeqCst);
             let new_ssthresh = (cwnd / 2).max(MAX_SCTP_PACKET_SIZE * 4); // Standard minimum ssthresh
             self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-            self.cwnd.store(MAX_SCTP_PACKET_SIZE, Ordering::SeqCst); // Reset to 1 MTU on timeout
+            self.cwnd.store(MAX_SCTP_PACKET_SIZE * 4, Ordering::SeqCst); // Reset to 4 MTUs on timeout
             self.partial_bytes_acked.store(0, Ordering::SeqCst);
             // Exit Fast Recovery on timeout
             self.fast_recovery_exit_tsn.store(0, Ordering::SeqCst);
@@ -2350,7 +2358,10 @@ mod tests {
     #[tokio::test]
     async fn test_sctp_association_retransmission_limit() {
         let (socket_tx, _) = tokio::sync::watch::channel(None);
-        let ice_conn = crate::transports::ice::conn::IceConn::new(socket_tx.subscribe(), "127.0.0.1:5000".parse().unwrap());
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
 
@@ -2391,7 +2402,10 @@ mod tests {
 
         // First timeout: transmit_count becomes 2
         sctp.inner.handle_timeout().await.unwrap();
-        assert_eq!(sctp.inner.state.lock().unwrap().clone(), SctpState::Connecting);
+        assert_eq!(
+            sctp.inner.state.lock().unwrap().clone(),
+            SctpState::Connecting
+        );
 
         // Manually set sent_time back to trigger another timeout
         {

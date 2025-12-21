@@ -254,7 +254,7 @@ impl Default for RtcConfiguration {
             ice_connection_timeout: std::time::Duration::from_secs(30),
             sctp_rto_initial: std::time::Duration::from_secs(1),
             sctp_rto_min: std::time::Duration::from_millis(200),
-            sctp_rto_max: std::time::Duration::from_secs(60),
+            sctp_rto_max: std::time::Duration::from_secs(3),
             sctp_max_association_retransmits: 0,
             dtls_buffer_size: 100,
         }
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
         assert_eq!(config.sctp_rto_initial, Duration::from_secs(1));
         assert_eq!(config.sctp_rto_min, Duration::from_millis(200));
-        assert_eq!(config.sctp_rto_max, Duration::from_secs(60));
+        assert_eq!(config.sctp_rto_max, Duration::from_secs(3));
         assert_eq!(config.sctp_max_association_retransmits, 0);
     }
 
