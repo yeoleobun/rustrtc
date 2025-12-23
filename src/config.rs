@@ -254,8 +254,8 @@ impl Default for RtcConfiguration {
             ice_connection_timeout: std::time::Duration::from_secs(30),
             sctp_rto_initial: std::time::Duration::from_secs(1),
             sctp_rto_min: std::time::Duration::from_millis(200),
-            sctp_rto_max: std::time::Duration::from_secs(3),
-            sctp_max_association_retransmits: 0,
+            sctp_rto_max: std::time::Duration::from_secs(60),
+            sctp_max_association_retransmits: 10,
             dtls_buffer_size: 100,
         }
     }

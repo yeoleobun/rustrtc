@@ -16,7 +16,7 @@ const RTO_ALPHA: f64 = 0.125;
 const RTO_BETA: f64 = 0.25;
 
 // Flow Control Constants
-const CWND_INITIAL: usize = 1200 * 40; // Start with 40 MTUs for a balance of speed and stability
+const CWND_INITIAL: usize = 1200 * 4; // RFC 4960 Section 7.2.1: min(4*MTU, max(2*MTU, 4380 bytes))
 const MAX_BURST: usize = 4; // RFC 4960 Section 7.2.4
 
 #[derive(Debug, Clone)]
@@ -164,6 +164,7 @@ struct SctpInner {
 
     // Association Retransmission Limit
     max_association_retransmits: u32,
+    consecutive_timeouts: AtomicU32,
 
     // Receiver Window Tracking
     used_rwnd: AtomicUsize,
@@ -396,6 +397,7 @@ impl SctpTransport {
             peer_reconfig_request_sn: AtomicU32::new(u32::MAX), // Initial value to allow 0
             fast_recovery_exit_tsn: AtomicU32::new(0),
             max_association_retransmits: config.sctp_max_association_retransmits,
+            consecutive_timeouts: AtomicU32::new(0),
             used_rwnd: AtomicUsize::new(0),
             packets_received: AtomicU64::new(0),
             cached_rto_timeout: Mutex::new(None),
@@ -648,17 +650,14 @@ impl SctpInner {
     async fn handle_timeout(&self) -> Result<()> {
         let mut to_retransmit = Vec::new();
         let mut abandoned_tsn: Option<u32> = None;
+        let mut any_expired = false;
 
         // 1. Collect all expired chunks and backoff RTO once
         let now = Instant::now();
         let rto = { self.rto_state.lock().unwrap().rto };
         {
             let mut sent_queue = self.sent_queue.lock().unwrap();
-            if let Some((_, record)) = sent_queue.iter().next() {
-                if now < record.sent_time + Duration::from_secs_f64(rto) {
-                    return Ok(());
-                }
-            } else {
+            if sent_queue.is_empty() {
                 return Ok(());
             }
 
@@ -674,6 +673,7 @@ impl SctpInner {
             for (tsn, record) in sent_queue.iter_mut() {
                 let expiry = record.sent_time + Duration::from_secs_f64(rto);
                 if now >= expiry {
+                    any_expired = true;
                     // Check for abandonment
                     let mut abandoned = false;
                     if let Some(Some(max_rexmit)) = channel_info.get(&record.stream_id) {
@@ -688,25 +688,13 @@ impl SctpInner {
                             abandoned_tsn = Some(*tsn);
                         }
                     } else {
-                        // Check for association-wide retransmission limit
-                        if record.transmit_count >= self.max_association_retransmits
-                            && self.max_association_retransmits > 0
-                        {
-                            warn!(
-                                "SCTP Association retransmission limit reached ({}), closing",
-                                self.max_association_retransmits
-                            );
-                            self.set_state(SctpState::Closed);
-                            return Ok(());
-                        }
-
                         // RFC 4960 Section 6.3.3: Retransmit only the earliest outstanding DATA chunks
                         // that fit into a single packet of size MTU.
                         let current_len: usize = to_retransmit
                             .iter()
                             .map(|(_, p): &(u32, Bytes)| p.len())
                             .sum();
-                        if current_len + record.payload.len() < DEFAULT_MAX_PAYLOAD_SIZE * 4 {
+                        if current_len + record.payload.len() < DEFAULT_MAX_PAYLOAD_SIZE {
                             to_retransmit.push((*tsn, record.payload.clone()));
                             record.transmit_count += 1;
                             record.sent_time = now; // restart timer; don't sample RTT on retransmit
@@ -722,14 +710,27 @@ impl SctpInner {
             self.send_forward_tsn(tsn).await?;
         }
 
-        if !to_retransmit.is_empty() {
+        if any_expired {
             // Backoff RTO once per timer tick
             let mut rto_state = self.rto_state.lock().unwrap();
             rto_state.backoff();
+
+            let timeouts = self.consecutive_timeouts.fetch_add(1, Ordering::SeqCst) + 1;
+            if timeouts >= self.max_association_retransmits && self.max_association_retransmits > 0
+            {
+                warn!(
+                    "SCTP Association retransmission limit reached ({}), closing",
+                    self.max_association_retransmits
+                );
+                self.set_state(SctpState::Closed);
+                return Ok(());
+            }
+
             debug!(
-                "T3-RTX Timeout! Retransmitting {} chunks, New RTO: {}",
+                "T3-RTX Timeout! Retransmitting {} chunks, New RTO: {}, Consecutive Timeouts: {}",
                 to_retransmit.len(),
-                rto_state.rto
+                rto_state.rto,
+                timeouts
             );
 
             // Reduce ssthresh and cwnd (RFC 4960 / Modern TCP)
@@ -864,6 +865,7 @@ impl SctpInner {
                 CT_HEARTBEAT => self.handle_heartbeat(chunk_value).await?,
                 CT_HEARTBEAT_ACK => {
                     trace!("SCTP HEARTBEAT ACK received");
+                    self.consecutive_timeouts.store(0, Ordering::SeqCst);
                 }
                 CT_FORWARD_TSN => self.handle_forward_tsn(chunk_value).await?,
                 CT_RECONFIG => self.handle_reconfig(chunk_value).await?,
@@ -1066,6 +1068,10 @@ impl SctpInner {
                 let mut sent_queue = self.sent_queue.lock().unwrap();
                 apply_sack_to_sent_queue(&mut *sent_queue, cumulative_tsn_ack, &gap_blocks, now)
             };
+
+            if outcome.bytes_acked_by_cum_tsn > 0 || !outcome.rtt_samples.is_empty() {
+                self.consecutive_timeouts.store(0, Ordering::SeqCst);
+            }
 
             for rtt in outcome.rtt_samples {
                 self.update_rto(rtt);
@@ -2424,5 +2430,77 @@ mod tests {
         // Mock SctpInner
         // This is hard because SctpInner has many fields.
         // But we can test handle_forward_tsn logic if we make it more testable or just test the side effects.
+    }
+
+    #[tokio::test]
+    async fn test_sctp_retransmission_head_of_line_blocking_fix() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (sctp, _) = SctpTransport::new(
+            dtls,
+            mpsc::channel(1).1,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        let rto = { sctp.inner.rto_state.lock().unwrap().rto };
+
+        // Add two chunks to sent queue
+        // TSN 100: recently sent (not expired)
+        // TSN 101: sent long ago (expired)
+        {
+            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            sent_queue.insert(
+                100,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"first"),
+                    sent_time: Instant::now(), // Just sent
+                    transmit_count: 0,
+                    missing_reports: 0,
+                    stream_id: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                },
+            );
+            sent_queue.insert(
+                101,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"second"),
+                    sent_time: Instant::now() - Duration::from_secs_f64(rto + 1.0), // Expired
+                    transmit_count: 0,
+                    missing_reports: 0,
+                    stream_id: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                },
+            );
+        }
+
+        // Before fix, this would return early because TSN 100 is not expired.
+        // After fix, it should retransmit TSN 101.
+        sctp.inner.handle_timeout().await.unwrap();
+
+        {
+            let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let rec100 = sent_queue.get(&100).unwrap();
+            let rec101 = sent_queue.get(&101).unwrap();
+
+            assert_eq!(
+                rec100.transmit_count, 0,
+                "TSN 100 should not be retransmitted"
+            );
+            assert_eq!(rec101.transmit_count, 1, "TSN 101 should be retransmitted");
+        }
     }
 }
