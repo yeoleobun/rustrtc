@@ -89,6 +89,7 @@ async fn test_dtls_handshake_server_hello() -> Result<()> {
 
     let handshake_msg = HandshakeMessage {
         msg_type: HandshakeType::ClientHello,
+        total_length: body.len() as u32,
         message_seq: 0,
         fragment_offset: 0,
         fragment_length: body.len() as u32,

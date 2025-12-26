@@ -41,6 +41,7 @@ impl TryFrom<u8> for HandshakeType {
 #[derive(Debug, Clone)]
 pub struct HandshakeMessage {
     pub msg_type: HandshakeType,
+    pub total_length: u32,
     pub message_seq: u16,
     pub fragment_offset: u32, // 24-bit
     pub fragment_length: u32, // 24-bit
@@ -80,7 +81,7 @@ impl HandshakeMessage {
 
         let msg_type = HandshakeType::try_from(buf[0])?;
 
-        let _length = u32::from_be_bytes([0, buf[1], buf[2], buf[3]]);
+        let total_length = u32::from_be_bytes([0, buf[1], buf[2], buf[3]]);
         let message_seq = u16::from_be_bytes([buf[4], buf[5]]);
         let fragment_offset = u32::from_be_bytes([0, buf[6], buf[7], buf[8]]);
         let fragment_length = u32::from_be_bytes([0, buf[9], buf[10], buf[11]]);
@@ -94,6 +95,7 @@ impl HandshakeMessage {
 
         Ok(Some(Self {
             msg_type,
+            total_length,
             message_seq,
             fragment_offset,
             fragment_length,
@@ -534,6 +536,7 @@ mod tests {
             message_seq: 1,
             fragment_offset: 0,
             fragment_length: 5,
+            total_length: 5,
             body: Bytes::from_static(b"hello"),
         };
 

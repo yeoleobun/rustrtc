@@ -515,18 +515,59 @@ impl DtlsInner {
                         continue;
                     }
 
-                    // Expected message
+                    // Expected message - handle fragmentation
+                    let (processing_msg, processing_raw) = if msg.total_length
+                        != msg.fragment_length
+                    {
+                        if ctx.incomplete_msg_seq != msg.message_seq || msg.fragment_offset == 0 {
+                            // New message or first fragment, reset buffer
+                            ctx.incomplete_handshake.clear();
+                            ctx.incomplete_msg_seq = msg.message_seq;
+                        }
+
+                        ctx.incomplete_handshake.extend_from_slice(&msg.body[..]);
+
+                        if ctx.incomplete_handshake.len() < msg.total_length as usize {
+                            // Still incomplete, wait for more fragments
+                            continue;
+                        }
+
+                        // Fully reassembled
+                        let full_msg = HandshakeMessage {
+                            msg_type: msg.msg_type,
+                            total_length: msg.total_length,
+                            message_seq: msg.message_seq,
+                            fragment_offset: 0,
+                            fragment_length: msg.total_length,
+                            body: ctx.incomplete_handshake.split().freeze(),
+                        };
+
+                        let mut full_raw = BytesMut::new();
+                        full_msg.encode(&mut full_raw);
+                        (full_msg, full_raw.freeze())
+                    } else {
+                        // Not fragmented
+                        (msg, raw_msg)
+                    };
+
                     ctx.recv_message_seq += 1;
 
-                    if msg.msg_type != HandshakeType::Finished
-                        && msg.msg_type != HandshakeType::HelloRequest
-                        && msg.msg_type != HandshakeType::HelloVerifyRequest
+                    if processing_msg.msg_type != HandshakeType::Finished
+                        && processing_msg.msg_type != HandshakeType::HelloRequest
+                        && processing_msg.msg_type != HandshakeType::HelloVerifyRequest
                     {
-                        ctx.handshake_messages.extend_from_slice(&raw_msg[..]);
+                        ctx.handshake_messages
+                            .extend_from_slice(&processing_raw[..]);
                     }
 
-                    self.handle_handshake_message(msg, &raw_msg, ctx, certificate, is_client)
-                        .await?;
+                    self.handle_handshake_message(
+                        processing_msg,
+                        &processing_raw,
+                        ctx,
+                        certificate,
+                        is_client,
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     warn!("Failed to decode handshake message: {}", e);
@@ -716,6 +757,7 @@ impl DtlsInner {
             message_seq: ctx.message_seq,
             fragment_offset: 0,
             fragment_length: body.len() as u32,
+            total_length: body.len() as u32,
             body: body.freeze(),
         };
 
@@ -750,6 +792,7 @@ impl DtlsInner {
             message_seq: ctx.message_seq,
             fragment_offset: 0,
             fragment_length: body.len() as u32,
+            total_length: body.len() as u32,
             body: body.freeze(),
         };
 
@@ -808,6 +851,7 @@ impl DtlsInner {
 
         let handshake_msg = HandshakeMessage {
             msg_type: HandshakeType::ServerKeyExchange,
+            total_length: body.len() as u32,
             message_seq: ctx.message_seq,
             fragment_offset: 0,
             fragment_length: body.len() as u32,
@@ -837,6 +881,7 @@ impl DtlsInner {
 
         let handshake_msg = HandshakeMessage {
             msg_type: HandshakeType::ServerHelloDone,
+            total_length: body.len() as u32,
             message_seq: ctx.message_seq,
             fragment_offset: 0,
             fragment_length: body.len() as u32,
@@ -1032,6 +1077,7 @@ impl DtlsInner {
 
             let handshake_msg = HandshakeMessage {
                 msg_type: HandshakeType::Finished,
+                total_length: body.len() as u32,
                 message_seq: ctx.message_seq,
                 fragment_offset: 0,
                 fragment_length: body.len() as u32,
@@ -1148,6 +1194,7 @@ impl DtlsInner {
 
             let handshake_msg = HandshakeMessage {
                 msg_type: HandshakeType::ClientHello,
+                total_length: body.len() as u32,
                 message_seq: ctx.message_seq,
                 fragment_offset: 0,
                 fragment_length: body.len() as u32,
@@ -1255,6 +1302,7 @@ impl DtlsInner {
 
         let handshake_msg = HandshakeMessage {
             msg_type: HandshakeType::ClientKeyExchange,
+            total_length: body.len() as u32,
             message_seq: ctx.message_seq,
             fragment_offset: 0,
             fragment_length: body.len() as u32,
@@ -1362,6 +1410,7 @@ impl DtlsInner {
 
         let handshake_msg = HandshakeMessage {
             msg_type: HandshakeType::Finished,
+            total_length: body.len() as u32,
             message_seq: ctx.message_seq,
             fragment_offset: 0,
             fragment_length: body.len() as u32,
@@ -1450,6 +1499,7 @@ impl DtlsInner {
 
             let handshake_msg = HandshakeMessage {
                 msg_type: HandshakeType::ClientHello,
+                total_length: body.len() as u32,
                 message_seq: ctx.message_seq,
                 fragment_offset: 0,
                 fragment_length: body.len() as u32,
@@ -1825,6 +1875,8 @@ struct HandshakeContext {
     message_seq: u16,
     recv_message_seq: u16,
     last_flight_buffer: Option<Vec<u8>>,
+    incomplete_handshake: BytesMut,
+    incomplete_msg_seq: u16,
     local_secret: Option<EphemeralSecret>,
     local_public_key_bytes: Vec<u8>,
     peer_public_key: Option<Vec<u8>>,
@@ -1850,6 +1902,8 @@ impl HandshakeContext {
             message_seq: 0,
             recv_message_seq: 0,
             last_flight_buffer: None,
+            incomplete_handshake: BytesMut::new(),
+            incomplete_msg_seq: 0,
             local_secret: Some(local_secret),
             local_public_key_bytes,
             peer_public_key: None,
