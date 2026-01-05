@@ -85,3 +85,32 @@ async fn test_rtp_local_sdp_port() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_ssrc_negotiation_without_track() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::WebRtc;
+
+    let pc = PeerConnection::new(config);
+
+    // Add a transceiver without adding a track
+    pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendOnly);
+
+    let offer = pc.create_offer()?;
+
+    // Check if the offer contains a=ssrc
+    let sdp = offer.to_sdp_string();
+    assert!(
+        sdp.contains("a=ssrc:"),
+        "SDP should contain a=ssrc even without a track"
+    );
+    assert!(sdp.contains("a=sendonly"), "SDP should contain a=sendonly");
+    assert!(
+        sdp.contains("a=msid:"),
+        "SDP should contain a=msid in WebRTC mode"
+    );
+
+    Ok(())
+}

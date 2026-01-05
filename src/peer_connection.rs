@@ -441,6 +441,13 @@ impl PeerConnection {
         let receiver = builder.build();
 
         let transceiver = Arc::new(RtpTransceiver::new(kind, direction));
+        if direction.sends() {
+            let ssrc = self.inner.ssrc_generator.fetch_add(1, Ordering::Relaxed);
+            *transceiver.sender_ssrc.lock().unwrap() = Some(ssrc);
+            *transceiver.sender_stream_id.lock().unwrap() = Some("default".to_string());
+            *transceiver.sender_track_id.lock().unwrap() =
+                Some(format!("track-{}", transceiver.id()));
+        }
         *transceiver.receiver.lock().unwrap() = Some(receiver);
 
         let mut list = self.inner.transceivers.lock().unwrap();
@@ -468,7 +475,11 @@ impl PeerConnection {
             crate::media::frame::MediaKind::Video => MediaKind::Video,
         };
         let transceiver = self.add_transceiver(kind, TransceiverDirection::SendRecv);
-        let ssrc = self.inner.ssrc_generator.fetch_add(1, Ordering::Relaxed);
+        let ssrc = transceiver
+            .sender_ssrc
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| self.inner.ssrc_generator.fetch_add(1, Ordering::Relaxed));
 
         let mut builder = RtpSenderBuilder::new(track, ssrc)
             .stream_id(stream_id)
@@ -505,6 +516,11 @@ impl PeerConnection {
         }
 
         let sender = builder.build();
+
+        // Update transceiver's pre-allocated info to match the actual sender
+        *transceiver.sender_ssrc.lock().unwrap() = Some(sender.ssrc());
+        *transceiver.sender_stream_id.lock().unwrap() = Some(sender.stream_id().to_string());
+        *transceiver.sender_track_id.lock().unwrap() = Some(sender.track_id().to_string());
 
         // If transport is already established, set it on the sender immediately
         if let Some(transport) = self.inner.rtp_transport.lock().unwrap().as_ref() {
@@ -2105,8 +2121,10 @@ impl PeerConnectionInner {
 
             // If we are supposed to send, but have no sender (and it's not Application),
             // we must downgrade direction to avoid ghost tracks.
+            let has_sender_ssrc = transceiver.sender_ssrc.lock().unwrap().is_some();
             if direction.sends()
                 && sender_info.is_none()
+                && !has_sender_ssrc
                 && transceiver.kind() != MediaKind::Application
                 && !remote_expects_media
             {
@@ -2164,7 +2182,38 @@ impl PeerConnectionInner {
 
             self.populate_media_capabilities(&mut section, transceiver.kind(), sdp_type);
             if let Some(sender) = sender_info {
-                Self::attach_sender_attributes(&mut section, &sender, &mode);
+                Self::attach_sender_attributes(
+                    &mut section,
+                    sender.ssrc(),
+                    sender.cname(),
+                    sender.stream_id(),
+                    sender.track_id(),
+                    &mode,
+                );
+            } else if direction.sends() {
+                if let Some(ssrc) = *transceiver.sender_ssrc.lock().unwrap() {
+                    let cname = format!("rustrtc-cname-{ssrc}");
+                    let stream_id = transceiver
+                        .sender_stream_id
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string());
+                    let track_id = transceiver
+                        .sender_track_id
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| format!("track-{}", transceiver.id()));
+                    Self::attach_sender_attributes(
+                        &mut section,
+                        ssrc,
+                        &cname,
+                        &stream_id,
+                        &track_id,
+                        &mode,
+                    );
+                }
             }
 
             if self.config.transport_mode == TransportMode::Srtp {
@@ -2216,14 +2265,12 @@ impl PeerConnectionInner {
 
     fn attach_sender_attributes(
         section: &mut MediaSection,
-        sender: &Arc<RtpSender>,
+        ssrc: u32,
+        cname: &str,
+        stream_id: &str,
+        track_id: &str,
         mode: &TransportMode,
     ) {
-        let ssrc = sender.ssrc();
-        let cname = sender.cname();
-        let stream_id = sender.stream_id();
-        let track_id = sender.track_id();
-
         if *mode == TransportMode::WebRtc {
             section.attributes.push(Attribute::new(
                 "msid",
@@ -2537,6 +2584,9 @@ pub struct RtpTransceiver {
     sender: Mutex<Option<Arc<RtpSender>>>,
     receiver: Mutex<Option<Arc<RtpReceiver>>>,
     rtp_transport: Mutex<Option<Weak<RtpTransport>>>,
+    sender_ssrc: Mutex<Option<u32>>,
+    sender_stream_id: Mutex<Option<String>>,
+    sender_track_id: Mutex<Option<String>>,
 }
 
 impl RtpTransceiver {
@@ -2549,6 +2599,9 @@ impl RtpTransceiver {
             sender: Mutex::new(None),
             receiver: Mutex::new(None),
             rtp_transport: Mutex::new(None),
+            sender_ssrc: Mutex::new(None),
+            sender_stream_id: Mutex::new(None),
+            sender_track_id: Mutex::new(None),
         }
     }
 
@@ -2558,6 +2611,18 @@ impl RtpTransceiver {
 
     pub fn kind(&self) -> MediaKind {
         self.kind
+    }
+
+    pub fn sender_ssrc(&self) -> Option<u32> {
+        *self.sender_ssrc.lock().unwrap()
+    }
+
+    pub fn sender_stream_id(&self) -> Option<String> {
+        self.sender_stream_id.lock().unwrap().clone()
+    }
+
+    pub fn sender_track_id(&self) -> Option<String> {
+        self.sender_track_id.lock().unwrap().clone()
     }
 
     pub fn direction(&self) -> TransceiverDirection {
@@ -2592,6 +2657,10 @@ impl RtpTransceiver {
                     s.set_transport(transport);
                 }
             }
+            // Sync pre-allocated fields
+            *self.sender_ssrc.lock().unwrap() = Some(s.ssrc());
+            *self.sender_stream_id.lock().unwrap() = Some(s.stream_id().to_string());
+            *self.sender_track_id.lock().unwrap() = Some(s.track_id().to_string());
         }
         *self.sender.lock().unwrap() = sender;
     }
@@ -2775,7 +2844,7 @@ impl RtpSender {
         let mut rtcp_rx = self.rtcp_tx.subscribe();
 
         tokio::spawn(async move {
-            let mut sequence_number = 0u16;
+            let mut sequence_number = next_seq.load(Ordering::SeqCst);
             let mut last_source_ts: Option<u32> = None;
             let mut timestamp_offset = random_u32(); // Start with random offset
 
@@ -2794,7 +2863,7 @@ impl RtpSender {
                     }
                     res = track.recv() => {
                         match res {
-                            Ok(sample) => {
+                            Ok(mut sample) => {
                                 let payload_type = {
                                     let p = params_lock.lock().unwrap();
                                     p.payload_type
@@ -2806,11 +2875,20 @@ impl RtpSender {
                                     crate::media::MediaSample::Video(f) => f.sequence_number.is_some(),
                                 };
 
+                                // Always rewrite sequence numbers to ensure continuity on the wire
+                                match &mut sample {
+                                    crate::media::MediaSample::Audio(f) => f.sequence_number = None,
+                                    crate::media::MediaSample::Video(f) => f.sequence_number = None,
+                                }
+
                                 let mut packet = sample.into_rtp_packet(
                                     ssrc,
                                     payload_type,
                                     &mut sequence_number,
                                 );
+
+                                // Update the shared next_sequence_number
+                                next_seq.store(sequence_number, Ordering::SeqCst);
 
                                 if !app_controlled {
                                     // Application doesn't control seq/ts, use rustrtc's logic
