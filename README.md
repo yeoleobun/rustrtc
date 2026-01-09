@@ -1,6 +1,9 @@
 # rustrtc
 
-A high-performance implementation of WebRTC. 
+[![Crates.io](https://img.shields.io/crates/v/rustrtc.svg)](https://crates.io/crates/rustrtc)
+[![Documentation](https://docs.rs/rustrtc/badge.svg)](https://docs.rs/rustrtc)
+
+A high-performance implementation of WebRTC.
 
 ## Features
 
@@ -11,9 +14,9 @@ A high-performance implementation of WebRTC.
 
 ## Benchmark game (rustrtc vs webrtc-rs & pion) in 0.2.28
 
-**CPU:**  `AMD Ryzen 7 5700X 8-Core Processor`   
+**CPU:**  `AMD Ryzen 7 5700X 8-Core Processor`
 **OS** `5.15.0-118-generic #128-Ubuntu`  
-**Compiler** `rustc 1.91.0 (f8297e351 2025-10-28)`,  `go version go1.23.0 linux/amd64`   
+**Compiler** `rustc 1.91.0 (f8297e351 2025-10-28)`,  `go version go1.23.0 linux/amd64`
 
 ```shell
 nice@miuda.ai rustrtc % cargo run -r --example benchmark
@@ -59,10 +62,10 @@ pion       | ██████████████████████�
 ```
 
 **Key Findings:**
+
 - **Throughput**: `rustrtc` is ~2.8x faster than `webrtc-rs` and ~2.3x faster than `pion`.
 - **Memory**: `rustrtc` uses ~48% less memory than `webrtc-rs` and ~66% less than `pion`.
 - **Setup Latency**: Significantly faster connection setup (0.22ms vs 1.36ms/0.90ms).
-
 
 ## Usage
 
@@ -141,6 +144,7 @@ You can run the examples provided in the repository.
 A multi-user video conferencing server. It receives media from each participant and forwards it to others.
 
 1. Run the server:
+
     ```bash
     cargo run --example rustrtc_sfu
     ```
@@ -148,11 +152,13 @@ A multi-user video conferencing server. It receives media from each participant 
 2. Open your browser and navigate to `http://127.0.0.1:8081`. Open multiple tabs/windows to simulate multiple users.
 
 ![rustrtcsfu](./rustrtc_sfu.png)
+
 ### Echo Server
 
 The echo server example demonstrates how to accept a WebRTC connection, receive data on a data channel, and echo it back. It also supports video playback if an IVF file is provided.
 
 1. Run the server:
+
     ```bash
     cargo run --example echo_server
     ```
@@ -164,6 +170,7 @@ The echo server example demonstrates how to accept a WebRTC connection, receive 
 A multi-user chat room using WebRTC DataChannels.
 
 1. Run the server:
+
     ```bash
     cargo run --example datachannel_chat
     ```
@@ -175,6 +182,7 @@ A multi-user chat room using WebRTC DataChannels.
 Records audio from the browser's microphone and saves it to a file (`output.ulaw`) on the server.
 
 1. Run the server:
+
     ```bash
     cargo run --example audio_saver
     ```
@@ -186,15 +194,16 @@ Records audio from the browser's microphone and saves it to a file (`output.ulaw
 Streams a video file (`examples/static/output.ivf`) via RTP to a UDP port, which can be played back using `ffplay`.
 
 1. Run the server:
+
     ```bash
     cargo run --example rtp_play
     ```
 
 2. In a separate terminal, run `ffplay` (requires ffmpeg installed):
+
     ```bash
     ffplay -protocol_whitelist file,udp,rtp -i examples/rtp_play.sdp
     ```
-
 
 ## License
 
