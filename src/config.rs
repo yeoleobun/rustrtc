@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Describes how credentials are conveyed for a given ICE server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum IceCredentialType {
     #[default]
     Password,
@@ -14,6 +15,7 @@ pub struct IceServer {
     pub urls: Vec<String>,
     pub username: Option<String>,
     pub credential: Option<String>,
+    #[serde(default)]
     pub credential_type: IceCredentialType,
 }
 
