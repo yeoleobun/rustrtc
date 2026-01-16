@@ -665,11 +665,6 @@ impl PeerConnection {
                     // Also extract direction
                     let direction: TransceiverDirection = section.direction.into();
                     t.set_direction(direction);
-
-                    // Assign MID if not yet assigned
-                    if t.mid().is_none() {
-                        t.set_mid(section.mid.clone());
-                    }
                 }
             }
         } else {
