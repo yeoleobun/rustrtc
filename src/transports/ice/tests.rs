@@ -388,3 +388,47 @@ impl AuthHandler for StaticAuthHandler {
         Ok(generate_auth_key(username, realm, &self.password))
     }
 }
+
+#[test]
+fn ice_candidate_foundation_compliance() {
+    let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let host = IceCandidate::host(addr, 1);
+    
+    // Check foundation format (should be alphanumeric, no colons)
+    // The previous implementation used "host:127.0.0.1" which contained ':'
+    assert!(!host.foundation.contains(':'));
+    assert!(host.foundation.chars().all(|c| c.is_ascii_alphanumeric()));
+    
+    // Check SDP output
+    let sdp = host.to_sdp();
+    assert!(sdp.contains(" typ host"));
+    // Should verify it starts with foundation
+    let parts: Vec<&str> = sdp.split_whitespace().collect();
+    let foundation = parts[0];
+    assert_eq!(foundation, host.foundation);
+    
+    // Check srflx
+    let mapped: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+    let srflx = IceCandidate::server_reflexive(addr, mapped, 1);
+    assert!(!srflx.foundation.contains(':'));
+    assert!(srflx.foundation.chars().all(|c| c.is_ascii_alphanumeric()));
+    
+    // Ensure foundation is same for same type/base
+    let srflx2 = IceCandidate::server_reflexive(addr, "1.2.3.5:6000".parse().unwrap(), 1);
+    assert_eq!(srflx.foundation, srflx2.foundation);
+    
+    // Ensure foundation is different for different base
+    let addr2: SocketAddr = "192.168.0.1:5000".parse().unwrap();
+    let srflx3 = IceCandidate::server_reflexive(addr2, mapped, 1);
+    assert_ne!(srflx.foundation, srflx3.foundation);
+    
+    // Check relay
+    let relay = IceCandidate::relay(mapped, 1, "udp");
+    assert!(!relay.foundation.contains(':'));
+    
+    // Check that host and srflx have different foundations even if same address (though unlikely in practice for base vs mapped)
+    // Actually foundation computation uses type.
+    let host_same_addr = IceCandidate::host(addr, 1);
+    let srflx_same_base = IceCandidate::server_reflexive(addr, mapped, 1); 
+    assert_ne!(host_same_addr.foundation, srflx_same_base.foundation);
+}

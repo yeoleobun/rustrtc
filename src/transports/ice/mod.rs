@@ -964,7 +964,11 @@ async fn handle_stun_request(
         debug!("Discovered peer reflexive candidate: {}", addr);
         let mut candidate = IceCandidate::host(addr, 1); // Use host for now, or prflx
         candidate.typ = IceCandidateType::PeerReflexive;
-        candidate.foundation = "prflx".to_string();
+        candidate.foundation = IceCandidate::compute_foundation(
+            IceCandidateType::PeerReflexive,
+            candidate.base_address(),
+            "udp",
+        );
         candidate.priority = IceCandidate::priority_for(IceCandidateType::PeerReflexive, 1);
 
         let mut list = inner.remote_candidates.lock().unwrap();
@@ -1279,9 +1283,20 @@ pub struct IceCandidate {
 }
 
 impl IceCandidate {
+    fn compute_foundation(typ: IceCandidateType, base_addr: SocketAddr, transport: &str) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        typ.hash(&mut hasher);
+        base_addr.ip().hash(&mut hasher);
+        transport.hash(&mut hasher);
+        format!("{:x}", hasher.finish())
+    }
+
     pub fn host(address: SocketAddr, component: u16) -> Self {
         Self {
-            foundation: format!("host:{}", address.ip()),
+            foundation: Self::compute_foundation(IceCandidateType::Host, address, "udp"),
             priority: IceCandidate::priority_for(IceCandidateType::Host, component),
             address,
             typ: IceCandidateType::Host,
@@ -1301,7 +1316,7 @@ impl IceCandidate {
 
     fn server_reflexive(base: SocketAddr, mapped: SocketAddr, component: u16) -> Self {
         Self {
-            foundation: format!("srflx:{}", mapped.ip()),
+            foundation: Self::compute_foundation(IceCandidateType::ServerReflexive, base, "udp"),
             priority: IceCandidate::priority_for(IceCandidateType::ServerReflexive, component),
             address: mapped,
             typ: IceCandidateType::ServerReflexive,
@@ -1313,7 +1328,7 @@ impl IceCandidate {
 
     fn relay(mapped: SocketAddr, component: u16, transport: &str) -> Self {
         Self {
-            foundation: format!("relay:{}", mapped.ip()),
+            foundation: Self::compute_foundation(IceCandidateType::Relay, mapped, transport),
             priority: IceCandidate::priority_for(IceCandidateType::Relay, component),
             address: mapped,
             typ: IceCandidateType::Relay,
@@ -1402,7 +1417,7 @@ impl IceCandidate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IceCandidateType {
     Host,
     ServerReflexive,

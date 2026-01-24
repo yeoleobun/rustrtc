@@ -678,40 +678,7 @@ impl PeerConnection {
             remote.is_some()
         };
 
-        // Extract parameters for initial negotiation or reinvite
-        if !is_reinvite {
-            // Initial negotiation: extract parameters from remote SDP
-            debug!("Initial negotiation: extracting parameters from remote SDP");
-            let transceivers = self.inner.transceivers.lock().unwrap().clone();
-
-            // Match by index since MID may not be assigned yet
-            for (i, section) in desc.media_sections.iter().enumerate() {
-                if i < transceivers.len() {
-                    let t = &transceivers[i];
-                    let payload_map = Self::extract_payload_map(section);
-                    if !payload_map.is_empty() {
-                        let _ = t.update_payload_map(payload_map);
-                    }
-                    let extmap = Self::extract_extmap(section);
-                    let _ = t.update_extmap(extmap);
-                    // Also extract direction
-                    let direction: TransceiverDirection = section.direction.into();
-                    t.set_direction(direction);
-
-                    // Assign MID if not yet assigned
-                    if t.mid().is_none() {
-                        t.set_mid(section.mid.clone());
-                    }
-
-                    // Extract SSRC if present
-                    if let Some(receiver) = t.receiver() {
-                        if let Some(ssrc) = Self::extract_ssrc_from_section(section) {
-                            receiver.set_ssrc(ssrc);
-                        }
-                    }
-                }
-            }
-        } else {
+        if is_reinvite {
             // Apply reinvite at correct timing based on role
             let current_state = *self.inner.signaling_state.borrow();
             match (desc.sdp_type, current_state) {
@@ -988,6 +955,16 @@ impl PeerConnection {
                 }
 
                 if let Some(t) = found_transceiver {
+                    // Update transceiver parameters
+                    let payload_map = Self::extract_payload_map(section);
+                    if !payload_map.is_empty() {
+                        let _ = t.update_payload_map(payload_map);
+                    }
+                    let extmap = Self::extract_extmap(section);
+                    let _ = t.update_extmap(extmap);
+                    let direction: TransceiverDirection = section.direction.into();
+                    t.set_direction(direction);
+
                     if let Some(ssrc_val) = ssrc {
                         if let Some(rx) = t.receiver.lock().unwrap().as_ref() {
                             rx.set_ssrc(ssrc_val);
@@ -1098,6 +1075,16 @@ impl PeerConnection {
                 }
 
                 if let Some(t) = found_transceiver {
+                    // Update transceiver parameters
+                    let payload_map = Self::extract_payload_map(section);
+                    if !payload_map.is_empty() {
+                        let _ = t.update_payload_map(payload_map);
+                    }
+                    let extmap = Self::extract_extmap(section);
+                    let _ = t.update_extmap(extmap);
+                    let direction: TransceiverDirection = section.direction.into();
+                    t.set_direction(direction);
+
                     let mut ssrc = None;
                     for attr in &section.attributes {
                         if attr.key == "ssrc"
@@ -2393,7 +2380,26 @@ impl PeerConnectionInner {
             }
             ordered
         } else {
-            transceivers
+            // For Offer, we must ensure MIDs and sort by them to maintain m-line stability
+            // This handles cases where transceivers were added out-of-order relative to their
+            // assigned MIDs (e.g. reused from previous negotiations)
+            for t in &transceivers {
+                self.ensure_mid(t);
+            }
+
+            let mut ordered = transceivers.clone();
+            ordered.sort_by(|a, b| {
+                let mid_a = a.mid().unwrap_or_default();
+                let mid_b = b.mid().unwrap_or_default();
+
+                // Try to sort numerically if possible ("0", "1", "10")
+                // otherwise lexicographically ("0", "1", "a")
+                match (mid_a.parse::<u64>(), mid_b.parse::<u64>()) {
+                    (Ok(na), Ok(nb)) => na.cmp(&nb),
+                    _ => mid_a.cmp(&mid_b),
+                }
+            });
+            ordered
         };
 
         self.ice_transport
