@@ -296,6 +296,8 @@ struct PeerConnectionInner {
     _dtls_role_rx: watch::Receiver<Option<bool>>,
     stats_collector: Arc<StatsCollector>,
     ssrc_generator: AtomicU32,
+    disconnect_reason: watch::Sender<Option<DisconnectReason>>,
+    _disconnect_reason_rx: watch::Receiver<Option<DisconnectReason>>,
 }
 
 fn generate_sdes_key_params() -> String {
@@ -347,6 +349,7 @@ impl PeerConnection {
         let ssrc_generator = AtomicU32::new(config.ssrc_start);
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (disconnect_reason_tx, disconnect_reason_rx) = watch::channel(None);
 
         let inner = PeerConnectionInner {
             config,
@@ -375,6 +378,8 @@ impl PeerConnection {
             _dtls_role_rx: dtls_role_rx.clone(),
             stats_collector: Arc::new(StatsCollector::new()),
             ssrc_generator,
+            disconnect_reason: disconnect_reason_tx,
+            _disconnect_reason_rx: disconnect_reason_rx,
         };
         let pc = Self {
             inner: Arc::new(inner),
@@ -1802,6 +1807,17 @@ impl PeerConnection {
         self.inner.ice_gathering_state.subscribe()
     }
 
+    /// Subscribe to disconnect reason updates. The value changes from `None` to
+    /// `Some(reason)` when the connection is disconnected, failed, or closed.
+    pub fn subscribe_disconnect_reason(&self) -> watch::Receiver<Option<DisconnectReason>> {
+        self.inner.disconnect_reason.subscribe()
+    }
+
+    /// Returns the current disconnect reason, if any.
+    pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
+        self.inner.disconnect_reason.borrow().clone()
+    }
+
     pub fn local_description(&self) -> Option<SessionDescription> {
         self.inner.local_description.lock().unwrap().clone()
     }
@@ -1811,7 +1827,7 @@ impl PeerConnection {
     }
 
     pub fn close(&self) {
-        self.inner.close();
+        self.inner.close_with_reason(DisconnectReason::LocalClose);
     }
 
     pub async fn recv(&self) -> Option<PeerConnectionEvent> {
@@ -2284,12 +2300,28 @@ async fn run_rtp_direct_loop(
             }
             crate::transports::ice::IceTransportState::Failed => {
                 if let Some(inner) = inner_weak.upgrade() {
+                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                        if cur.is_none() {
+                            *cur = Some(DisconnectReason::IceFailed);
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     let _ = inner.peer_state.send(PeerConnectionState::Failed);
                 }
                 return;
             }
             crate::transports::ice::IceTransportState::Closed => {
                 if let Some(inner) = inner_weak.upgrade() {
+                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                        if cur.is_none() {
+                            *cur = Some(DisconnectReason::IceDisconnected);
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     let _ = inner.peer_state.send(PeerConnectionState::Closed);
                 }
                 return;
@@ -2356,12 +2388,28 @@ async fn run_ice_dtls_loop(
             }
             crate::transports::ice::IceTransportState::Failed => {
                 if let Some(inner) = inner_weak.upgrade() {
+                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                        if cur.is_none() {
+                            *cur = Some(DisconnectReason::IceFailed);
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     let _ = inner.peer_state.send(PeerConnectionState::Failed);
                 }
                 return;
             }
             crate::transports::ice::IceTransportState::Closed => {
                 if let Some(inner) = inner_weak.upgrade() {
+                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                        if cur.is_none() {
+                            *cur = Some(DisconnectReason::IceDisconnected);
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     let _ = inner.peer_state.send(PeerConnectionState::Closed);
                 }
                 return;
@@ -2372,6 +2420,44 @@ async fn run_ice_dtls_loop(
         if ice_state_rx.changed().await.is_err() {
             return;
         }
+    }
+}
+
+/// Check the SCTP transport's close reason and propagate it to the
+/// PeerConnection's disconnect_reason if not already set.
+fn propagate_sctp_close_reason(inner: &PeerConnectionInner) {
+    let sctp_reason = inner
+        .sctp_transport
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|sctp| {
+            sctp.close_reason().and_then(|r| match r.as_str() {
+                "HEARTBEAT_TIMEOUT" => Some(DisconnectReason::SctpHeartbeatTimeout),
+                "HEARTBEAT_DEAD" => Some(DisconnectReason::SctpPeerDead),
+                "REMOTE_ABORT" => Some(DisconnectReason::SctpRemoteAbort),
+                "REMOTE_SHUTDOWN" => Some(DisconnectReason::SctpRemoteShutdown),
+                "DTLS_FAILED" => Some(DisconnectReason::DtlsFailed),
+                "DTLS_CLOSED" | "DTLS_CHANNEL_CLOSED" => Some(DisconnectReason::DtlsClosed),
+                "LOCAL_CLOSE" => None,
+                "INIT_TIMEOUT" => Some(DisconnectReason::TransportStartFailed(
+                    "SCTP INIT timeout".into(),
+                )),
+                "TRANSPORT_CLOSED" => {
+                    Some(DisconnectReason::Unknown("transport channel closed".into()))
+                }
+                other => Some(DisconnectReason::Unknown(other.to_string())),
+            })
+        });
+    if let Some(reason) = sctp_reason {
+        let _ = inner.disconnect_reason.send_if_modified(|cur| {
+            if cur.is_none() {
+                *cur = Some(reason);
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
@@ -2387,6 +2473,14 @@ async fn handle_connected_state_no_dtls(
         match pc_temp.start_dtls(false).await {
             Err(e) => {
                 debug!("Transport start failed: {}", e);
+                let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                    if cur.is_none() {
+                        *cur = Some(DisconnectReason::TransportStartFailed(e.to_string()));
+                        true
+                    } else {
+                        false
+                    }
+                });
                 let _ = inner.peer_state.send(PeerConnectionState::Failed);
                 return false;
             }
@@ -2395,6 +2489,9 @@ async fn handle_connected_state_no_dtls(
                 loop {
                     tokio::select! {
                         _ = &mut rtcp_loop => {
+                            // Combined loop exited (SCTP/DTLS/RTCP runner finished)
+                            // Check SCTP close reason and propagate it
+                            propagate_sctp_close_reason(&inner);
                             break;
                         }
                         res = ice_state_rx.changed() => {
@@ -2429,6 +2526,14 @@ async fn handle_connected_state(
                 match pc_temp.start_dtls(is_client).await {
                     Err(e) => {
                         debug!("DTLS start failed: {}", e);
+                        let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                            if cur.is_none() {
+                                *cur = Some(DisconnectReason::DtlsFailed);
+                                true
+                            } else {
+                                false
+                            }
+                        });
                         let _ = inner.peer_state.send(PeerConnectionState::Failed);
                         return false;
                     }
@@ -2448,6 +2553,8 @@ async fn handle_connected_state(
                             loop {
                                 tokio::select! {
                                     _ = &mut rtcp_loop => {
+                                        // Combined loop exited (SCTP/DTLS/RTCP runner finished)
+                                        propagate_sctp_close_reason(&inner);
                                         break;
                                     }
                                     res = ice_state_rx.changed() => {
@@ -2462,6 +2569,14 @@ async fn handle_connected_state(
                                             let state = dtls_rx.borrow().clone();
                                             if state == crate::transports::dtls::DtlsState::Closed || state == crate::transports::dtls::DtlsState::Failed {
                                                 debug!("DTLS closed/failed, disconnecting PC");
+                                                let reason = if state == crate::transports::dtls::DtlsState::Failed {
+                                                    DisconnectReason::DtlsFailed
+                                                } else {
+                                                    DisconnectReason::DtlsClosed
+                                                };
+                                                let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                                                    if cur.is_none() { *cur = Some(reason); true } else { false }
+                                                });
                                                 let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
                                                 let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
                                                 return false;
@@ -2476,6 +2591,8 @@ async fn handle_connected_state(
                             loop {
                                 tokio::select! {
                                     _ = &mut rtcp_loop => {
+                                        // Combined loop exited (SCTP/DTLS/RTCP runner finished)
+                                        propagate_sctp_close_reason(&inner);
                                         break;
                                     }
                                     res = ice_state_rx.changed() => {
@@ -3029,10 +3146,49 @@ impl PeerConnectionInner {
         None
     }
 
-    fn close(&self) {
+    fn close_with_reason(&self, reason: DisconnectReason) {
         if *self.peer_state.borrow() == PeerConnectionState::Closed {
             return;
         }
+
+        let final_reason = if self.disconnect_reason.borrow().is_none() {
+            let sctp_reason = self
+                .sctp_transport
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|sctp| {
+                    sctp.close_reason().and_then(|r| match r.as_str() {
+                        "HEARTBEAT_TIMEOUT" => Some(DisconnectReason::SctpHeartbeatTimeout),
+                        "HEARTBEAT_DEAD" => Some(DisconnectReason::SctpPeerDead),
+                        "REMOTE_ABORT" => Some(DisconnectReason::SctpRemoteAbort),
+                        "REMOTE_SHUTDOWN" => Some(DisconnectReason::SctpRemoteShutdown),
+                        "DTLS_FAILED" => Some(DisconnectReason::DtlsFailed),
+                        "DTLS_CLOSED" | "DTLS_CHANNEL_CLOSED" => Some(DisconnectReason::DtlsClosed),
+                        "LOCAL_CLOSE" => None, // Not more specific than the outer reason
+                        "INIT_TIMEOUT" => Some(DisconnectReason::TransportStartFailed(
+                            "SCTP INIT timeout".into(),
+                        )),
+                        "TRANSPORT_CLOSED" => {
+                            Some(DisconnectReason::Unknown("transport channel closed".into()))
+                        }
+                        other => Some(DisconnectReason::Unknown(other.to_string())),
+                    })
+                });
+            let r = sctp_reason.unwrap_or(reason);
+            let _ = self.disconnect_reason.send(Some(r.clone()));
+            r
+        } else {
+            self.disconnect_reason.borrow().clone().unwrap()
+        };
+
+        tracing::info!("PeerConnection closing: reason={}", final_reason);
+
+        // Log SCTP diagnostic info for debugging network issues
+        if let Some(sctp) = self.sctp_transport.lock().unwrap().as_ref() {
+            tracing::info!("SCTP diagnostics: {}", sctp.diagnostic_info());
+        }
+
         let _ = self.signaling_state.send(SignalingState::Closed);
         let _ = self.peer_state.send(PeerConnectionState::Closed);
         let _ = self.ice_connection_state.send(IceConnectionState::Closed);
@@ -3098,7 +3254,7 @@ impl PeerConnectionInner {
 impl Drop for PeerConnectionInner {
     fn drop(&mut self) {
         debug!("PeerConnectionInner dropped, stopping ICE transport");
-        self.close();
+        self.close_with_reason(DisconnectReason::Dropped);
     }
 }
 
@@ -3124,6 +3280,62 @@ pub enum PeerConnectionState {
     Disconnected,
     Failed,
     Closed,
+}
+
+/// Describes why a PeerConnection was disconnected or closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisconnectReason {
+    /// Local side called close()
+    LocalClose,
+    /// PeerConnection was dropped without explicit close
+    Dropped,
+    /// ICE transport failed (connectivity check failures)
+    IceFailed,
+    /// ICE transport disconnected (lost connectivity)
+    IceDisconnected,
+    /// DTLS transport failed
+    DtlsFailed,
+    /// DTLS transport closed
+    DtlsClosed,
+    /// SCTP association closed due to heartbeat timeout
+    /// (peer not responding to heartbeats)
+    SctpHeartbeatTimeout,
+    /// SCTP association closed because peer appears dead
+    /// (consecutive heartbeat failures during RTO backoff)
+    SctpPeerDead,
+    /// Remote peer sent SCTP ABORT
+    SctpRemoteAbort,
+    /// Remote peer sent SCTP SHUTDOWN
+    SctpRemoteShutdown,
+    /// SCTP transport start failed
+    TransportStartFailed(String),
+    /// Unknown or unspecified reason
+    Unknown(String),
+}
+
+impl std::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DisconnectReason::LocalClose => write!(f, "local close"),
+            DisconnectReason::Dropped => write!(f, "connection dropped"),
+            DisconnectReason::IceFailed => write!(f, "ICE failed"),
+            DisconnectReason::IceDisconnected => write!(f, "ICE disconnected"),
+            DisconnectReason::DtlsFailed => write!(f, "DTLS failed"),
+            DisconnectReason::DtlsClosed => write!(f, "DTLS closed"),
+            DisconnectReason::SctpHeartbeatTimeout => {
+                write!(f, "SCTP heartbeat timeout (peer unresponsive)")
+            }
+            DisconnectReason::SctpPeerDead => {
+                write!(f, "SCTP peer dead (consecutive heartbeat failures)")
+            }
+            DisconnectReason::SctpRemoteAbort => write!(f, "remote SCTP ABORT"),
+            DisconnectReason::SctpRemoteShutdown => write!(f, "remote SCTP SHUTDOWN"),
+            DisconnectReason::TransportStartFailed(e) => {
+                write!(f, "transport start failed: {}", e)
+            }
+            DisconnectReason::Unknown(s) => write!(f, "unknown: {}", s),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

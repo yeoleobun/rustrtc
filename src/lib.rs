@@ -16,7 +16,7 @@ pub use config::{
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 pub use peer_connection::{
-    IceConnectionState, IceGatheringState, PeerConnection, PeerConnectionEvent,
+    DisconnectReason, IceConnectionState, IceGatheringState, PeerConnection, PeerConnectionEvent,
     PeerConnectionState, RtpCodecParameters, RtpSender, RtpTransceiver, SignalingState,
     TransceiverDirection,
 };

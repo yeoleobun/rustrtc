@@ -70,6 +70,7 @@ pub enum StunClass {
 pub enum StunMethod {
     Binding,
     Allocate,
+    Refresh,
     CreatePermission,
     ChannelBind,
     Send,
@@ -118,6 +119,7 @@ fn encode_stun_message(
     let method_bits = match msg.method {
         StunMethod::Binding => 0x0001,
         StunMethod::Allocate => 0x0003,
+        StunMethod::Refresh => 0x0004,
         StunMethod::CreatePermission => 0x0008,
         StunMethod::ChannelBind => 0x0009,
         StunMethod::Send => 0x0006,
@@ -296,6 +298,7 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
     let method = match msg_type & 0x3EEF {
         0x0001 => StunMethod::Binding,
         0x0003 => StunMethod::Allocate,
+        0x0004 => StunMethod::Refresh,
         0x0008 => StunMethod::CreatePermission,
         0x0009 => StunMethod::ChannelBind,
         0x0006 => StunMethod::Send,

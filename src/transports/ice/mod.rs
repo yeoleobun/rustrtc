@@ -138,6 +138,11 @@ impl IceTransportRunner {
             tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
         );
+        // TURN refresh interval: every 120s (well under 300s permission timeout)
+        let mut turn_refresh_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(120),
+            Duration::from_secs(120),
+        );
         let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
         let mut gathering_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
 
@@ -200,6 +205,9 @@ impl IceTransportRunner {
                 }
                 _ = interval.tick() => {
                     Self::run_keepalive_tick(&self.inner).await;
+                }
+                _ = turn_refresh_interval.tick() => {
+                    Self::run_turn_refresh(&self.inner).await;
                 }
                 Some(_) = read_futures.next() => {
                     // Read loop finished
@@ -344,6 +352,169 @@ impl IceTransportRunner {
                 }
             }
         }
+    }
+
+    /// Periodically refresh TURN allocations, permissions, and channel bindings
+    /// to prevent them from expiring. Per RFC 5766:
+    ///   - Allocation lifetime: 600s (default), refresh before expiry
+    ///   - Permission lifetime: 300s, must be refreshed
+    ///   - ChannelBind lifetime: 600s, must be refreshed
+    ///
+    /// This runs every ~120s which is well under all three timeouts.
+    async fn run_turn_refresh(inner: &Arc<IceTransportInner>) {
+        let state = *inner.state.borrow();
+        if state != IceTransportState::Connected && state != IceTransportState::Disconnected {
+            return;
+        }
+
+        let pair_opt = inner.selected_pair.lock().unwrap().clone();
+        let pair = match pair_opt {
+            Some(p) if p.local.typ == IceCandidateType::Relay => p,
+            _ => return, // Not using TURN relay, nothing to refresh
+        };
+
+        let client = {
+            let clients = inner.gatherer.turn_clients.lock().unwrap();
+            match clients.get(&pair.local.address) {
+                Some(c) => c.clone(),
+                None => return,
+            }
+        };
+
+        // 1. Refresh the allocation (extends lifetime)
+        match client.create_refresh_packet().await {
+            Ok((bytes, tx_id)) => {
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut map = inner.pending_transactions.lock().unwrap();
+                    map.insert(tx_id, tx);
+                }
+
+                if let Err(e) = client.send(&bytes).await {
+                    debug!("TURN Refresh send failed: {}", e);
+                } else {
+                    let inner_weak = Arc::downgrade(inner);
+                    tokio::spawn(async move {
+                        match timeout(Duration::from_secs(5), rx).await {
+                            Ok(Ok(msg)) => {
+                                if msg.class == StunClass::SuccessResponse {
+                                    trace!("TURN allocation refreshed successfully");
+                                } else {
+                                    debug!("TURN Refresh failed: error={:?}", msg.error_code);
+                                }
+                            }
+                            _ => {
+                                debug!("TURN Refresh timeout");
+                            }
+                        }
+                        if let Some(inner) = inner_weak.upgrade() {
+                            let mut map = inner.pending_transactions.lock().unwrap();
+                            map.remove(&tx_id);
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                debug!("TURN Refresh packet creation failed: {}", e);
+            }
+        }
+
+        // 2. Refresh permission for the remote peer
+        let remote_addr = pair.remote.address;
+        match client.create_permission_packet(remote_addr).await {
+            Ok((bytes, tx_id)) => {
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut map = inner.pending_transactions.lock().unwrap();
+                    map.insert(tx_id, tx);
+                }
+
+                if let Err(e) = client.send(&bytes).await {
+                    debug!("TURN CreatePermission refresh send failed: {}", e);
+                } else {
+                    let inner_weak = Arc::downgrade(inner);
+                    tokio::spawn(async move {
+                        match timeout(Duration::from_secs(5), rx).await {
+                            Ok(Ok(msg)) => {
+                                if msg.class == StunClass::SuccessResponse {
+                                    trace!("TURN permission refreshed for {}", remote_addr);
+                                } else {
+                                    debug!(
+                                        "TURN CreatePermission refresh failed: error={:?}",
+                                        msg.error_code
+                                    );
+                                }
+                            }
+                            _ => {
+                                debug!("TURN CreatePermission refresh timeout");
+                            }
+                        }
+                        if let Some(inner) = inner_weak.upgrade() {
+                            let mut map = inner.pending_transactions.lock().unwrap();
+                            map.remove(&tx_id);
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                debug!("TURN CreatePermission packet creation failed: {}", e);
+            }
+        }
+
+        // 3. Refresh channel bindings for all bound peers
+        let bound_peers = client.bound_peers().await;
+        let num_bindings = bound_peers.len();
+        for peer in bound_peers {
+            if let Some(channel) = client.get_channel(peer).await {
+                match client.create_channel_rebind_packet(peer, channel).await {
+                    Ok((bytes, tx_id)) => {
+                        let (tx, rx) = oneshot::channel();
+                        {
+                            let mut map = inner.pending_transactions.lock().unwrap();
+                            map.insert(tx_id, tx);
+                        }
+
+                        if let Err(e) = client.send(&bytes).await {
+                            debug!("TURN ChannelBind refresh send failed: {}", e);
+                        } else {
+                            let inner_weak = Arc::downgrade(inner);
+                            tokio::spawn(async move {
+                                match timeout(Duration::from_secs(5), rx).await {
+                                    Ok(Ok(msg)) => {
+                                        if msg.class == StunClass::SuccessResponse {
+                                            trace!(
+                                                "TURN ChannelBind refreshed: {} -> ch {}",
+                                                peer, channel
+                                            );
+                                        } else {
+                                            debug!(
+                                                "TURN ChannelBind refresh failed: error={:?}",
+                                                msg.error_code
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        debug!("TURN ChannelBind refresh timeout");
+                                    }
+                                }
+                                if let Some(inner) = inner_weak.upgrade() {
+                                    let mut map = inner.pending_transactions.lock().unwrap();
+                                    map.remove(&tx_id);
+                                }
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        debug!("TURN ChannelBind refresh packet creation failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "TURN refresh sent: allocation + permission({}) + {} channel bindings",
+            remote_addr, num_bindings
+        );
     }
 }
 

@@ -249,6 +249,34 @@ impl TurnClient {
         bail!("TURN create-permission failed after retries");
     }
 
+    pub(crate) async fn create_refresh_packet(&self) -> Result<(Vec<u8>, [u8; 12])> {
+        let tx_id = random_bytes::<12>();
+        let auth_guard = self.auth.lock().await;
+        let auth = auth_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("TURN refresh: no auth context"))?;
+
+        let attributes = vec![
+            StunAttribute::Lifetime(DEFAULT_TURN_LIFETIME),
+            StunAttribute::Username(auth.username.clone()),
+            StunAttribute::Realm(auth.realm.clone()),
+            StunAttribute::Nonce(auth.nonce.clone()),
+        ];
+
+        let msg = StunMessage {
+            class: StunClass::Request,
+            method: StunMethod::Refresh,
+            transaction_id: tx_id,
+            attributes,
+        };
+        let bytes = msg.encode(Some(&auth.key), true)?;
+        Ok((bytes, tx_id))
+    }
+
+    pub(crate) async fn bound_peers(&self) -> Vec<SocketAddr> {
+        self.channels.lock().await.keys().cloned().collect()
+    }
+
     pub(crate) async fn send(&self, data: &[u8]) -> Result<()> {
         match &self.transport {
             TurnTransport::Udp { socket, server } => {
@@ -381,6 +409,33 @@ impl TurnClient {
         };
         let bytes = msg.encode(Some(&auth.key), true)?;
         Ok((bytes, tx_id, channel_number))
+    }
+
+    pub(crate) async fn create_channel_rebind_packet(
+        &self,
+        peer: SocketAddr,
+        channel_number: u16,
+    ) -> Result<(Vec<u8>, [u8; 12])> {
+        let tx_id = random_bytes::<12>();
+        let auth_guard = self.auth.lock().await;
+        let auth = auth_guard.as_ref().ok_or_else(|| anyhow!("no auth"))?;
+
+        let attributes = vec![
+            StunAttribute::ChannelNumber(channel_number),
+            StunAttribute::XorPeerAddress(peer),
+            StunAttribute::Username(auth.username.clone()),
+            StunAttribute::Realm(auth.realm.clone()),
+            StunAttribute::Nonce(auth.nonce.clone()),
+        ];
+
+        let msg = StunMessage {
+            class: StunClass::Request,
+            method: StunMethod::ChannelBind,
+            transaction_id: tx_id,
+            attributes,
+        };
+        let bytes = msg.encode(Some(&auth.key), true)?;
+        Ok((bytes, tx_id))
     }
 
     pub(crate) async fn add_channel(&self, peer: SocketAddr, channel: u16) {

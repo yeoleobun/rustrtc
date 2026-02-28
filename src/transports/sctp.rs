@@ -308,6 +308,7 @@ struct SctpInner {
     stats_retransmissions: AtomicU64,
     stats_heartbeats_sent: AtomicU64,
     stats_created_time: Instant,
+    close_reason: Mutex<Option<String>>,
 }
 
 struct SctpCleanupGuard<'a> {
@@ -694,6 +695,7 @@ impl SctpTransport {
             stats_retransmissions: AtomicU64::new(0),
             stats_heartbeats_sent: AtomicU64::new(0),
             stats_created_time: Instant::now(),
+            close_reason: Mutex::new(None),
             outgoing_packet_tx,
         });
 
@@ -746,6 +748,50 @@ impl SctpTransport {
 
     pub fn buffered_amount(&self) -> usize {
         self.inner.flight_size.load(Ordering::SeqCst)
+    }
+
+    /// Returns the reason why the SCTP association closed, if available.
+    pub fn close_reason(&self) -> Option<String> {
+        self.inner.close_reason.lock().unwrap().clone()
+    }
+
+    /// Returns a diagnostic summary of the SCTP transport state.
+    /// Useful for understanding connection health when the close reason is unknown.
+    pub fn diagnostic_info(&self) -> String {
+        let state = self.inner.state.lock().unwrap().clone();
+        let rto = self.inner.rto_state.lock().unwrap().rto;
+        let error_count = self.inner.association_error_count.load(Ordering::SeqCst);
+        let max_retransmits = self.inner.max_association_retransmits;
+        let retransmissions = self.inner.stats_retransmissions.load(Ordering::SeqCst);
+        let flight_size = self.inner.flight_size.load(Ordering::SeqCst);
+        let sent_queue_len = self.inner.sent_queue.lock().unwrap().len();
+        let consecutive_hb_failures = self
+            .inner
+            .consecutive_heartbeat_failures
+            .load(Ordering::SeqCst);
+        let duration = self.inner.stats_created_time.elapsed();
+        let bytes_sent = self.inner.stats_bytes_sent.load(Ordering::SeqCst);
+        let bytes_received = self.inner.stats_bytes_received.load(Ordering::SeqCst);
+        let close_reason = self.inner.close_reason.lock().unwrap().clone();
+
+        format!(
+            "state={:?}, duration={:.0}s, rto={:.1}s, errors={}/{}, hb_failures={}, retransmits={}, \
+             flight={}B, pending={}, sent={:.1}KB, recv={:.1}KB{}",
+            state,
+            duration.as_secs_f64(),
+            rto,
+            error_count,
+            max_retransmits,
+            consecutive_hb_failures,
+            retransmissions,
+            flight_size,
+            sent_queue_len,
+            bytes_sent as f64 / 1024.0,
+            bytes_received as f64 / 1024.0,
+            close_reason
+                .map(|r| format!(", close_reason={}", r))
+                .unwrap_or_default(),
+        )
     }
 
     pub fn close(&self) {
@@ -901,6 +947,7 @@ impl SctpInner {
             tokio::select! {
                 _ = close_rx.notified() => {
                     debug!("SctpTransport run_loop exiting (closed)");
+                    *self.close_reason.lock().unwrap() = Some("LOCAL_CLOSE".into());
                     break;
                 },
                 res = dtls_state_rx.changed() => {
@@ -909,11 +956,17 @@ impl SctpInner {
                             let state = dtls_state_rx.borrow_and_update().clone();
                             if let DtlsState::Failed | DtlsState::Closed = state {
                                 debug!("SctpTransport run_loop exiting (DTLS {})", state);
+                                let reason = match state {
+                                    DtlsState::Failed => "DTLS_FAILED",
+                                    _ => "DTLS_CLOSED",
+                                };
+                                *self.close_reason.lock().unwrap() = Some(reason.into());
                                 break;
                             }
                         }
                         Err(_) => {
                             debug!("SctpTransport run_loop exiting (DTLS state channel closed)");
+                            *self.close_reason.lock().unwrap() = Some("DTLS_CHANNEL_CLOSED".into());
                             break;
                         }
                     }
@@ -965,6 +1018,7 @@ impl SctpInner {
                         }
                         None => {
                             debug!("SCTP loop error: Channel closed");
+                            *self.close_reason.lock().unwrap() = Some("INCOMING_CHANNEL_CLOSED".into());
                             break;
                         }
                     }
@@ -1001,6 +1055,7 @@ impl SctpInner {
         if failures > SCTP_MAX_INIT_RETRANS {
             debug!("SCTP T1 max retransmissions exceeded, closing");
             self.t1_cancel();
+            *self.close_reason.lock().unwrap() = Some("INIT_TIMEOUT".into());
             self.set_state(SctpState::Closed);
             return Ok(());
         }
@@ -1334,6 +1389,7 @@ impl SctpInner {
                         error_count, self.max_association_retransmits
                     );
                     self.print_stats("REMOTE_ABORT");
+                    *self.close_reason.lock().unwrap() = Some("REMOTE_ABORT".into());
                     self.set_state(SctpState::Closed);
                 }
                 CT_SHUTDOWN => {
@@ -1345,6 +1401,7 @@ impl SctpInner {
                 CT_SHUTDOWN_ACK => {
                     debug!("SCTP SHUTDOWN ACK received, closing connection");
                     self.print_stats("REMOTE_SHUTDOWN");
+                    *self.close_reason.lock().unwrap() = Some("REMOTE_SHUTDOWN".into());
                     self.set_state(SctpState::Closed);
                 }
                 _ => {
@@ -2189,6 +2246,7 @@ impl SctpInner {
                             );
                             drop(rto_state);
                             self.print_stats("HEARTBEAT_TIMEOUT");
+                            *self.close_reason.lock().unwrap() = Some("HEARTBEAT_TIMEOUT".into());
                             self.set_state(SctpState::Closed);
                             return Ok(());
                         }
@@ -2206,6 +2264,7 @@ impl SctpInner {
                                 consecutive_failures, rto
                             );
                             self.print_stats("HEARTBEAT_DEAD");
+                            *self.close_reason.lock().unwrap() = Some("HEARTBEAT_DEAD".into());
                             self.set_state(SctpState::Closed);
                             return Ok(());
                         }
@@ -2607,6 +2666,7 @@ impl SctpInner {
 
         if let Err(_) = self.outgoing_packet_tx.send(buf.freeze()) {
             debug!("Failed to send SCTP packet to transport: channel closed");
+            *self.close_reason.lock().unwrap() = Some("TRANSPORT_CLOSED".into());
             self.set_state(SctpState::Closed);
             return Err(anyhow::anyhow!("Transport channel closed"));
         }
