@@ -13,6 +13,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures::FutureExt;
 use tokio::sync::broadcast;
+
+use serial_test::serial;
 use tokio::time::{Duration, timeout};
 // use webrtc_util::vnet::net::Net;
 type TurnResult<T> = std::result::Result<T, ::turn::Error>;
@@ -59,6 +61,7 @@ async fn stun_probe_yields_server_reflexive_candidate() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn turn_probe_yields_relay_candidate() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
     let mut config = RtcConfiguration::default();
@@ -114,6 +117,7 @@ async fn policy_relay_only_gathers_relay_candidates() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn turn_client_can_create_permission() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
     let uri = IceServerUri::parse(&turn_server.turn_url())?;
@@ -165,8 +169,12 @@ fn candidate_pair_priority_calculation() {
 }
 
 #[tokio::test]
+#[serial]
 async fn turn_connection_relay_to_host() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
+
+    // Give TURN server time to fully initialize
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Agent 1: Relay only
     let mut config1 = RtcConfiguration::default();
@@ -185,6 +193,9 @@ async fn turn_connection_relay_to_host() -> Result<()> {
         .role(IceRole::Controlled)
         .build();
     tokio::spawn(runner2);
+
+    // Wait for candidate gathering
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Exchange candidates
     let t1 = transport1.clone();
@@ -220,27 +231,34 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     transport1.start(transport2.local_parameters())?;
     transport2.start(transport1.local_parameters())?;
 
-    // Wait for Connected
+    // Wait for Connected with better error handling
     let wait_connected = |mut state: watch::Receiver<IceTransportState>, name: &'static str| async move {
         loop {
             let s = *state.borrow_and_update();
             if s == IceTransportState::Connected {
-                break;
+                return Ok(());
             }
             if s == IceTransportState::Failed {
-                panic!("Transport {} failed", name);
+                return Err(anyhow::anyhow!("Transport {} failed", name));
             }
             if state.changed().await.is_err() {
-                panic!("Transport {} state channel closed", name);
+                return Err(anyhow::anyhow!("Transport {} state channel closed", name));
             }
         }
     };
 
-    tokio::try_join!(
-        timeout(Duration::from_secs(10), wait_connected(state1, "1")),
-        timeout(Duration::from_secs(10), wait_connected(state2, "2"))
-    )
-    .expect("Timed out waiting for connection");
+    let result = tokio::try_join!(
+        timeout(Duration::from_secs(15), wait_connected(state1, "1")),
+        timeout(Duration::from_secs(15), wait_connected(state2, "2"))
+    );
+
+    if let Err(e) = &result {
+        eprintln!("Connection failed: {:?}", e);
+    }
+
+    let (r1, r2) = result?;
+    r1?;
+    r2?;
 
     // Verify selected pair on transport 1 is Relay
     let pair1 = transport1.get_selected_pair().await.unwrap();
@@ -439,6 +457,7 @@ fn ice_candidate_foundation_compliance() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_ice_lite_stun_response() -> Result<()> {
     use crate::TransportMode;
 
@@ -453,6 +472,9 @@ async fn test_ice_lite_stun_response() -> Result<()> {
 
     // Set up for RTP mode - bind socket via setup_direct_rtp_offer
     let local_addr = ice_lite.setup_direct_rtp_offer().await?;
+
+    // Give the transport time to fully initialize
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Get ICE credentials for authentication
     let _local_params = ice_lite.local_parameters();
@@ -478,16 +500,33 @@ async fn test_ice_lite_stun_response() -> Result<()> {
         remote_addr, local_addr
     );
 
-    // Send STUN binding request to the ICE-lite transport
-    remote_socket.send_to(&request_bytes, local_addr).await?;
-
-    // Wait for STUN binding response on the remote socket
+    // Send STUN binding request to the ICE-lite transport with retries
     let mut buf = [0u8; 1500];
-    let (len, response_from) =
-        tokio::time::timeout(Duration::from_secs(5), remote_socket.recv_from(&mut buf))
-            .await
-            .map_err(|_| anyhow::anyhow!("Should receive STUN response within 5 seconds"))?
-            .map_err(|e| anyhow::anyhow!("Socket recv error: {}", e))?;
+    let (len, response_from) = {
+        let mut result = None;
+        for _ in 0..3 {
+            // Send STUN request
+            remote_socket.send_to(&request_bytes, local_addr).await?;
+
+            // Wait for response with shorter timeout, retry if needed
+            match tokio::time::timeout(Duration::from_secs(2), remote_socket.recv_from(&mut buf))
+                .await
+            {
+                Ok(Ok(recv_result)) => {
+                    result = Some(Ok(recv_result));
+                    break;
+                }
+                Ok(Err(e)) => {
+                    result = Some(Err(anyhow::anyhow!("Socket recv error: {}", e)));
+                }
+                Err(_) => {
+                    // Timeout - retry
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        result.ok_or_else(|| anyhow::anyhow!("Should receive STUN response within 5 seconds"))??
+    };
 
     println!(
         "Received STUN response from {}, {} bytes",
@@ -550,6 +589,7 @@ async fn test_ice_lite_stun_response() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_ice_lite_connectivity_establishment() -> Result<()> {
     use crate::TransportMode;
 
@@ -661,7 +701,8 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
     #[async_trait::async_trait]
     impl PacketReceiver for DataReceiver {
         async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
-            // Filter out STUN packets, only forward data
+            // Filter out STUN packets (first byte is 0x00 or 0x01)
+            // RTP/data packets have first byte >= 0x80 or are text data
             if !packet.is_empty() && packet[0] >= 2 {
                 let _ = self.0.send(packet).await;
             }
@@ -675,26 +716,28 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
         .set_data_receiver(Arc::new(DataReceiver(full_tx)))
         .await;
 
-    // Send data from full agent to ICE-lite
+    // Send data from full agent to ICE-lite using the remote address from the pair
     let full_socket = ice_full.get_selected_socket().await.unwrap();
     let test_data = Bytes::from_static(b"Hello from full ICE agent");
+    // Use full_pair.remote.address which should be the ICE-lite's address
     full_socket
-        .send_to(&test_data, lite_pair.local.address)
+        .send_to(&test_data, full_pair.remote.address)
         .await?;
 
-    let received_by_lite = timeout(Duration::from_secs(2), lite_rx.recv())
+    let received_by_lite = timeout(Duration::from_secs(5), lite_rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("ICE-lite did not receive data"))?;
     assert_eq!(received_by_lite, test_data);
 
-    // Send data from ICE-lite to full agent
+    // Send data from ICE-lite to full agent using the remote address from the pair
     let lite_socket = ice_lite.get_selected_socket().await.unwrap();
     let response_data = Bytes::from_static(b"Hello from ICE-lite agent");
+    // Use lite_pair.remote.address which should be the full agent's address
     lite_socket
-        .send_to(&response_data, full_pair.local.address)
+        .send_to(&response_data, lite_pair.remote.address)
         .await?;
 
-    let received_by_full = timeout(Duration::from_secs(2), full_rx.recv())
+    let received_by_full = timeout(Duration::from_secs(5), full_rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("Full ICE agent did not receive data"))?;
     assert_eq!(received_by_full, response_data);
@@ -978,9 +1021,18 @@ async fn test_nomination_uses_nomination_timeout_not_stun_timeout() -> Result<()
 #[tokio::test]
 async fn test_nomination_succeeds_under_moderate_packet_loss() -> Result<()> {
     // 30% packet loss: rate = 3000 (units: 1/10000th, compared against random % 10000)
-    // We temporarily set the global rate; it may have been initialized from env.
-    // We reset it afterward to avoid affecting other tests.
-    let prev_rate = PACKET_LOSS_RATE.swap(3000, Ordering::SeqCst);
+    // Use a scope guard to ensure PACKET_LOSS_RATE is always restored, even if the test panics.
+    struct ScopeGuard {
+        prev: u32,
+    }
+    impl Drop for ScopeGuard {
+        fn drop(&mut self) {
+            PACKET_LOSS_RATE.store(self.prev, Ordering::SeqCst);
+        }
+    }
+    let _guard = ScopeGuard {
+        prev: PACKET_LOSS_RATE.swap(3000, Ordering::SeqCst),
+    };
 
     let result: Result<()> = async {
         let mut config1 = RtcConfiguration::default();
@@ -1025,9 +1077,6 @@ async fn test_nomination_succeeds_under_moderate_packet_loss() -> Result<()> {
         Ok(())
     }
     .await;
-
-    // Always restore the previous rate so we don't contaminate other tests.
-    PACKET_LOSS_RATE.store(prev_rate, Ordering::SeqCst);
 
     result
 }

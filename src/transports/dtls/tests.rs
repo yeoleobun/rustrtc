@@ -2,9 +2,11 @@ use super::*;
 use crate::transports::PacketReceiver;
 use crate::transports::ice::IceSocketWrapper;
 use bytes::Bytes;
+use serial_test::serial;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
+
 
 #[tokio::test]
 async fn test_dtls_handshake_client_hello() -> Result<()> {
@@ -43,6 +45,7 @@ async fn test_dtls_handshake_client_hello() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_dtls_handshake_server_hello() -> Result<()> {
     let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
@@ -112,65 +115,80 @@ async fn test_dtls_handshake_server_hello() -> Result<()> {
 
     client_socket.send_to(&buf, server_addr).await?;
 
-    // Read response (ServerHello)
-    let mut recv_buf = vec![0u8; 8192];
-    let (len, _addr) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client_socket.recv_from(&mut recv_buf),
-    )
-    .await??;
+    // Collect all handshake messages from server
+    let mut received_hello = false;
+    let mut received_certificate = false;
+    let mut received_server_key_exchange = false;
+    let mut received_server_hello_done = false;
 
-    let mut data = Bytes::copy_from_slice(&recv_buf[..len]);
-    let record = DtlsRecord::decode(&mut data)?.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
-    assert_eq!(record.content_type, ContentType::Handshake);
+    while tokio::time::Instant::now() < deadline {
+        let mut recv_buf = vec![0u8; 8192];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client_socket.recv_from(&mut recv_buf),
+        )
+        .await;
 
-    let mut body = record.payload;
-    let msg = HandshakeMessage::decode(&mut body)?.unwrap();
+        match result {
+            Ok(Ok((len, _addr))) => {
+                let mut data = Bytes::copy_from_slice(&recv_buf[..len]);
+                while !data.is_empty() {
+                    if let Ok(Some(record)) = DtlsRecord::decode(&mut data) {
+                        if record.content_type == ContentType::Handshake {
+                            let mut payload = record.payload;
+                            while !payload.is_empty() {
+                                if let Ok(Some(msg)) = HandshakeMessage::decode(&mut payload) {
+                                    match msg.msg_type {
+                                        HandshakeType::ServerHello => received_hello = true,
+                                        HandshakeType::Certificate => received_certificate = true,
+                                        HandshakeType::ServerKeyExchange => {
+                                            received_server_key_exchange = true
+                                        }
+                                        HandshakeType::ServerHelloDone => {
+                                            received_server_hello_done = true
+                                        }
+                                        _ => {}
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                // Timeout or error - check if we have all messages
+                if received_hello
+                    && received_certificate
+                    && received_server_key_exchange
+                    && received_server_hello_done
+                {
+                    break;
+                }
+            }
+        }
 
-    assert_eq!(msg.msg_type, HandshakeType::ServerHello);
+        if received_hello
+            && received_certificate
+            && received_server_key_exchange
+            && received_server_hello_done
+        {
+            break;
+        }
+    }
 
-    // Read Certificate
-    let mut recv_buf = vec![0u8; 8192];
-    let (len, _addr) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client_socket.recv_from(&mut recv_buf),
-    )
-    .await??;
-    let mut data = Bytes::copy_from_slice(&recv_buf[..len]);
-    let record = DtlsRecord::decode(&mut data)?.unwrap();
-    assert_eq!(record.content_type, ContentType::Handshake);
-    let mut body = record.payload;
-    let msg = HandshakeMessage::decode(&mut body)?.unwrap();
-    assert_eq!(msg.msg_type, HandshakeType::Certificate);
-
-    // Read ServerKeyExchange
-    let mut recv_buf = vec![0u8; 8192];
-    let (len, _addr) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client_socket.recv_from(&mut recv_buf),
-    )
-    .await??;
-    let mut data = Bytes::copy_from_slice(&recv_buf[..len]);
-    let record = DtlsRecord::decode(&mut data)?.unwrap();
-    assert_eq!(record.content_type, ContentType::Handshake);
-    let mut body = record.payload;
-    let msg = HandshakeMessage::decode(&mut body)?.unwrap();
-    assert_eq!(msg.msg_type, HandshakeType::ServerKeyExchange);
-
-    // Read ServerHelloDone
-    let mut recv_buf = vec![0u8; 8192];
-    let (len, _addr) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client_socket.recv_from(&mut recv_buf),
-    )
-    .await??;
-    let mut data = Bytes::copy_from_slice(&recv_buf[..len]);
-    let record = DtlsRecord::decode(&mut data)?.unwrap();
-    assert_eq!(record.content_type, ContentType::Handshake);
-    let mut body = record.payload;
-    let msg = HandshakeMessage::decode(&mut body)?.unwrap();
-    assert_eq!(msg.msg_type, HandshakeType::ServerHelloDone);
+    assert!(received_hello, "Should receive ServerHello");
+    assert!(received_certificate, "Should receive Certificate");
+    assert!(
+        received_server_key_exchange,
+        "Should receive ServerKeyExchange"
+    );
+    assert!(received_server_hello_done, "Should receive ServerHelloDone");
 
     Ok(())
 }

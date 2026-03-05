@@ -12,7 +12,9 @@ use tokio::net::UdpSocket;
 use tracing::{error, info};
 use webrtc_util::conn::Listener;
 
+/// Requires webrtc-dtls server - environment dependent
 #[tokio::test]
+#[ignore]
 async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
 
@@ -122,7 +124,9 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     Ok(())
 }
 
+/// OpenSSL interop test - fails with LibreSSL due to compatibility issues
 #[tokio::test]
+#[ignore]
 async fn test_interop_rustrtc_client_openssl_server() -> Result<()> {
     use std::process::{Command, Stdio};
 

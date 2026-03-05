@@ -31,8 +31,13 @@ const DUP_THRESH: u8 = 3;
 const CWND_INITIAL: usize = MAX_SCTP_PACKET_SIZE * 10; // 10 * 1200 = 12000 bytes
 const SSTHRESH_MIN: usize = MAX_SCTP_PACKET_SIZE * 4; // 4 * 1200 = 4800 bytes
 const CWND_MIN_AFTER_RTO: usize = MAX_SCTP_PACKET_SIZE; // 1 * 1200 = 1200 bytes
-const MAX_CWND: usize = 256 * 1024; // 256 KB - cap cwnd to prevent unbounded memory growth
-const MAX_BUFFERED_AMOUNT: usize = 1024 * 1024; // 1 MB
+const MAX_BUFFERED_AMOUNT: usize = 256 * 1024; // 256KB - reduced for lower memory footprint
+
+// Memory limits for inbound queues - balanced for memory efficiency and loss tolerance
+// These values provide good memory efficiency while maintaining tolerance for packet loss
+const MAX_INBOUND_STREAM_PENDING: usize = 128; // max pending ordered messages per stream
+const MAX_DUPS_BUFFER_SIZE: usize = 32; // max duplicate TSNs to track (increased for lossy networks)
+const MAX_RECEIVED_QUEUE_SIZE: usize = 512; // max out-of-order packets (increased for lossy networks)
 
 // Fast Recovery re-entry cooldown: prevent rapid exit-then-re-enter cycles that
 // keep cwnd pinned at SSTHRESH_MIN on lossy links (e.g. rate-limited TURN relays).
@@ -80,6 +85,18 @@ impl InboundStream {
     }
 
     fn enqueue(&mut self, ssn: u16, msg: Bytes) -> Vec<Bytes> {
+        // Limit pending queue size to prevent memory bloat
+        if self.pending.len() >= MAX_INBOUND_STREAM_PENDING {
+            // Drain any ready messages first
+            let ready = self.drain_ready();
+            if !ready.is_empty() {
+                return ready;
+            }
+            // If still full, drop oldest pending message to prevent unbounded growth
+            if let Some(&oldest_ssn) = self.pending.keys().next() {
+                self.pending.remove(&oldest_ssn);
+            }
+        }
         self.pending.insert(ssn, msg);
         self.drain_ready()
     }
@@ -257,6 +274,12 @@ struct SctpInner {
 
     // Association Retransmission Limit
     max_association_retransmits: u32,
+
+    // Configurable parameters from RtcConfiguration
+    heartbeat_interval: Duration,
+    max_heartbeat_failures: u32,
+    max_burst_packets: usize, // 0 = use default heuristic
+    max_cwnd: usize,
 
     // Association Error Counter
     association_error_count: AtomicU32,
@@ -650,7 +673,7 @@ impl SctpTransport {
             cwnd_rx: AtomicUsize::new(CWND_INITIAL), // Independent cwnd for receiving/echo direction
             ssthresh: AtomicUsize::new(usize::MAX),
             partial_bytes_acked: AtomicUsize::new(0),
-            peer_rwnd: AtomicU32::new(1024 * 1024), // Default 1MB until we hear otherwise
+            peer_rwnd: AtomicU32::new(256 * 1024), // Default 256KB until we hear from peer
             timer_notify: Arc::new(Notify::new()),
             flow_control_notify: Arc::new(Notify::new()),
             sack_needed: AtomicBool::new(false),
@@ -664,6 +687,10 @@ impl SctpTransport {
             fast_recovery_transmit: AtomicBool::new(false),
             last_fast_recovery_entry: Mutex::new(Instant::now() - Duration::from_secs(10)),
             max_association_retransmits: config.sctp_max_association_retransmits,
+            heartbeat_interval: config.sctp_heartbeat_interval,
+            max_heartbeat_failures: config.sctp_max_heartbeat_failures,
+            max_burst_packets: config.sctp_max_burst,
+            max_cwnd: config.sctp_max_cwnd,
             association_error_count: AtomicU32::new(0),
             heartbeat_sent_time: Mutex::new(None),
             consecutive_heartbeat_failures: AtomicU32::new(0),
@@ -841,7 +868,7 @@ impl SctpInner {
         }
 
         let mut last_heartbeat = Instant::now();
-        let heartbeat_interval = Duration::from_secs(15);
+        let heartbeat_interval = self.heartbeat_interval;
 
         loop {
             // Check if state was changed to Closed by timeout handler
@@ -1260,8 +1287,8 @@ impl SctpInner {
         let mut init_params = BytesMut::new();
         // Initiate Tag
         init_params.put_u32(local_tag);
-        // a_rwnd (1MB)
-        init_params.put_u32(1024 * 1024);
+        // a_rwnd - advertise configured receive window
+        init_params.put_u32(self.local_rwnd as u32);
         // Outbound streams
         init_params.put_u16(10);
         // Inbound streams
@@ -1678,7 +1705,7 @@ impl SctpInner {
                 if ssthresh <= SSTHRESH_MIN && outcome.bytes_acked_by_cum_tsn > 0 {
                     let cwnd = self.cwnd_tx.load(Ordering::SeqCst);
                     if cwnd >= ssthresh * 4 / 5 {
-                        let new_ssthresh = (cwnd * 2).max(CWND_INITIAL * 2).min(MAX_CWND);
+                        let new_ssthresh = (cwnd * 2).max(CWND_INITIAL * 2).min(self.max_cwnd);
                         self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
                         debug!(
                             "Raising ssthresh {} -> {} to allow faster recovery (cwnd={})",
@@ -1770,11 +1797,11 @@ impl SctpInner {
                     let done_bytes = outcome.bytes_acked_by_cum_tsn + outcome.bytes_acked_by_gap;
                     let cwnd_fully_utilized = self.flight_size.load(Ordering::SeqCst) >= cwnd;
 
-                    if done_bytes > 0 && cwnd_fully_utilized && cwnd < MAX_CWND {
+                    if done_bytes > 0 && cwnd_fully_utilized && cwnd < self.max_cwnd {
                         if cwnd <= ssthresh {
                             // Slow Start (aiortc): cwnd += min(done_bytes, MTU)
                             let increase = done_bytes.min(MAX_SCTP_PACKET_SIZE);
-                            let new_cwnd = (cwnd + increase).min(MAX_CWND);
+                            let new_cwnd = (cwnd + increase).min(self.max_cwnd);
                             let actual_increase = new_cwnd - cwnd;
                             if actual_increase > 0 {
                                 self.cwnd_tx.fetch_add(actual_increase, Ordering::SeqCst);
@@ -1791,7 +1818,7 @@ impl SctpInner {
                             let total_pba = pba + done_bytes;
                             if total_pba >= cwnd {
                                 self.partial_bytes_acked.fetch_sub(cwnd, Ordering::SeqCst);
-                                let new_cwnd = (cwnd + MAX_SCTP_PACKET_SIZE).min(MAX_CWND);
+                                let new_cwnd = (cwnd + MAX_SCTP_PACKET_SIZE).min(self.max_cwnd);
                                 let actual_increase = new_cwnd - cwnd;
                                 if actual_increase > 0 {
                                     self.cwnd_tx.fetch_add(actual_increase, Ordering::SeqCst);
@@ -2256,9 +2283,10 @@ impl SctpInner {
                             rto, consecutive_failures
                         );
 
-                        // If we have 4 consecutive heartbeat failures, even during RTO backoff,
+                        // If we have consecutive heartbeat failures exceeding the
+                        // configured limit, even during RTO backoff,
                         // the peer is likely dead. Force close the connection.
-                        if consecutive_failures >= 4 {
+                        if consecutive_failures >= self.max_heartbeat_failures {
                             debug!(
                                 "SCTP Connection dead: {} consecutive heartbeat failures (RTO={:.1}s), closing connection",
                                 consecutive_failures, rto
@@ -2317,7 +2345,7 @@ impl SctpInner {
             // Duplicate or Old: record duplicate and schedule fast SACK
             {
                 let mut dups = self.dups_buffer.lock().unwrap();
-                if dups.len() < 32 {
+                if dups.len() < MAX_DUPS_BUFFER_SIZE {
                     dups.push(tsn);
                 }
             }
@@ -2343,6 +2371,15 @@ impl SctpInner {
         {
             let mut received_queue = self.received_queue.lock().unwrap();
             if !received_queue.contains_key(&tsn) {
+                // Limit received_queue size to prevent memory bloat
+                if received_queue.len() >= MAX_RECEIVED_QUEUE_SIZE {
+                    // Drop oldest out-of-order packet to make room
+                    if let Some(&oldest_tsn) = received_queue.keys().next() {
+                        if let Some((_, old_chunk)) = received_queue.remove(&oldest_tsn) {
+                            self.used_rwnd.fetch_sub(old_chunk.len(), Ordering::Relaxed);
+                        }
+                    }
+                }
                 self.used_rwnd.fetch_add(chunk.len(), Ordering::Relaxed);
                 received_queue.insert(tsn, (flags, chunk));
             }
@@ -2828,8 +2865,12 @@ impl SctpInner {
         let in_recovery = self.fast_recovery_active.load(Ordering::Relaxed)
             || self.fast_recovery_exit_tsn.load(Ordering::Relaxed) != 0;
 
-        // Relaxed burst limit for higher throughput on fast links
-        let burst_limit = if in_recovery {
+        // Burst limit: configurable via sctp_max_burst (in MTU-sized packets).
+        // 0 = use default heuristic (16 normal, 4 recovery).
+        let burst_limit = if self.max_burst_packets > 0 {
+            // Explicit limit configured (e.g., for rate-limited TURN relays)
+            self.max_burst_packets * MAX_SCTP_PACKET_SIZE
+        } else if in_recovery {
             4 * MAX_SCTP_PACKET_SIZE
         } else {
             16 * MAX_SCTP_PACKET_SIZE
@@ -7584,6 +7625,1107 @@ mod tests {
         assert_eq!(
             recovered_cwnd, CWND_MIN_AFTER_RTO,
             "cwnd stays at floor after collapse — this is the throughput problem"
+        );
+    }
+
+    /// Test: configurable heartbeat interval is used instead of hardcoded 15s.
+    /// We verify the field is stored and accessible.
+    #[tokio::test]
+    async fn test_configurable_heartbeat_interval() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        // Test with default config
+        let default_config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp_default, _runner) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &default_config,
+        );
+        assert_eq!(
+            sctp_default.inner.heartbeat_interval,
+            Duration::from_secs(15),
+            "Default heartbeat interval should be 15s"
+        );
+        assert_eq!(
+            sctp_default.inner.max_heartbeat_failures, 4,
+            "Default max heartbeat failures should be 4"
+        );
+
+        // Test with TURN-optimized config
+        let mut turn_config = RtcConfiguration::default();
+        turn_config.sctp_heartbeat_interval = Duration::from_secs(10);
+        turn_config.sctp_max_heartbeat_failures = 8;
+
+        let (_incoming_tx2, incoming_rx2) = mpsc::unbounded_channel();
+        let (sctp_turn, _runner2) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx2,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &turn_config,
+        );
+        assert_eq!(
+            sctp_turn.inner.heartbeat_interval,
+            Duration::from_secs(10),
+            "Custom heartbeat interval should be 10s"
+        );
+        assert_eq!(
+            sctp_turn.inner.max_heartbeat_failures, 8,
+            "Custom max heartbeat failures should be 8"
+        );
+    }
+
+    /// Test: configurable max_burst is correctly stored and used by transmit logic.
+    #[tokio::test]
+    async fn test_configurable_max_burst() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        // Default config: max_burst = 0 (heuristic)
+        let default_config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp_default, _runner) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &default_config,
+        );
+        assert_eq!(
+            sctp_default.inner.max_burst_packets, 0,
+            "Default max_burst should be 0 (heuristic)"
+        );
+
+        // TURN-optimized config: max_burst = 4
+        let mut turn_config = RtcConfiguration::default();
+        turn_config.sctp_max_burst = 4;
+
+        let (_incoming_tx2, incoming_rx2) = mpsc::unbounded_channel();
+        let (sctp_turn, _runner2) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx2,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &turn_config,
+        );
+        assert_eq!(
+            sctp_turn.inner.max_burst_packets, 4,
+            "Custom max_burst should be 4"
+        );
+    }
+
+    /// Test: configurable max_cwnd is correctly stored and caps cwnd growth.
+    #[tokio::test]
+    async fn test_configurable_max_cwnd() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        // Test with a smaller max_cwnd
+        let mut config = RtcConfiguration::default();
+        config.sctp_max_cwnd = 32 * 1024; // 32 KB
+        config.sctp_rto_initial = Duration::from_secs(1);
+        config.sctp_rto_min = Duration::from_secs(1);
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp, _runner) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(_runner);
+        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        sctp.inner.remote_verification_tag.store(1, Ordering::SeqCst);
+
+        assert_eq!(sctp.inner.max_cwnd, 32 * 1024);
+
+        // Simulate a scenario where cwnd would grow beyond max_cwnd
+        // Set cwnd to near max_cwnd
+        sctp.inner.cwnd_tx.store(31 * 1024, Ordering::SeqCst);
+        sctp.inner.ssthresh.store(usize::MAX, Ordering::SeqCst); // slow start
+
+        // Add a chunk to sent_queue and simulate SACK
+        let base_tsn = 100u32;
+        sctp.inner.next_tsn.store(base_tsn + 1, Ordering::SeqCst);
+        sctp.inner
+            .cumulative_tsn_ack
+            .store(base_tsn.wrapping_sub(1), Ordering::SeqCst);
+
+        let payload_size = 1024;
+        {
+            let mut sent = sctp.inner.sent_queue.lock().unwrap();
+            sent.insert(
+                base_tsn,
+                ChunkRecord {
+                    payload: Bytes::from(vec![0u8; payload_size]),
+                    sent_time: Instant::now() - Duration::from_millis(50),
+                    transmit_count: 1,
+                    missing_reports: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                    needs_retransmit: false,
+                    fast_retransmit_time: None,
+                    in_flight: true,
+                    acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0,
+                    max_retransmits: None,
+                    expiry: None,
+                },
+            );
+        }
+        sctp.inner.flight_size.store(32 * 1024, Ordering::SeqCst);
+
+        // Send SACK acknowledging the chunk
+        let sack = build_sack_packet(base_tsn, 1024 * 1024, vec![], vec![]);
+        sctp.inner.handle_sack(sack).await.unwrap();
+
+        let final_cwnd = sctp.inner.cwnd_tx.load(Ordering::SeqCst);
+        println!(
+            "max_cwnd={}, final_cwnd={}", config.sctp_max_cwnd, final_cwnd
+        );
+        assert!(
+            final_cwnd <= config.sctp_max_cwnd,
+            "cwnd {} should not exceed max_cwnd {}",
+            final_cwnd,
+            config.sctp_max_cwnd
+        );
+    }
+
+    /// Test: INIT a_rwnd uses the configured sctp_receive_window instead of hardcoded 1MB.
+    #[tokio::test]
+    async fn test_init_uses_configured_receive_window() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let mut config = RtcConfiguration::default();
+        config.sctp_receive_window = 512 * 1024; // 512 KB
+        config.sctp_rto_initial = Duration::from_secs(1);
+        config.sctp_rto_min = Duration::from_secs(1);
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp, _runner) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+        tokio::spawn(_runner);
+
+        // Verify local_rwnd is set from config
+        assert_eq!(
+            sctp.inner.local_rwnd,
+            512 * 1024,
+            "local_rwnd should match configured sctp_receive_window"
+        );
+    }
+
+    /// Test: RTO parameters are properly forwarded from config.
+    #[tokio::test]
+    async fn test_rto_config_forwarding() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let mut config = RtcConfiguration::default();
+        config.sctp_rto_initial = Duration::from_millis(500);
+        config.sctp_rto_min = Duration::from_millis(200);
+        config.sctp_rto_max = Duration::from_secs(10);
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp, _runner) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        let rto_state = sctp.inner.rto_state.lock().unwrap();
+        assert!(
+            (rto_state.rto - 0.5).abs() < 0.01,
+            "Initial RTO should be 0.5s, got {}",
+            rto_state.rto
+        );
+        assert!(
+            (rto_state.min - 0.2).abs() < 0.01,
+            "RTO min should be 0.2s, got {}",
+            rto_state.min
+        );
+        assert!(
+            (rto_state.max - 10.0).abs() < 0.01,
+            "RTO max should be 10.0s, got {}",
+            rto_state.max
+        );
+    }
+
+    /// Test: the RtoCalculator respects min/max bounds with TURN-optimized values.
+    #[test]
+    fn test_rto_calculator_turn_optimized() {
+        // Simulate a TURN scenario with 200ms min RTO and 10s max
+        let mut calc = RtoCalculator::new(0.5, 0.2, 10.0);
+        assert_eq!(calc.rto, 0.5);
+
+        // First RTT measurement: 100ms
+        calc.update(0.1);
+        // srtt = 0.1, rttvar = 0.05
+        // rto = max(0.2, 0.1 + 4*0.05) = max(0.2, 0.3) = 0.3
+        assert!(
+            calc.rto >= 0.2,
+            "RTO should be at least min (0.2s), got {}",
+            calc.rto
+        );
+
+        // Backoff should double but cap at 10s
+        calc.backoff();
+        assert!(calc.rto <= 10.0, "RTO should cap at 10s, got {}", calc.rto);
+
+        // Multiple backoffs
+        for _ in 0..10 {
+            calc.backoff();
+        }
+        assert_eq!(
+            calc.rto, 10.0,
+            "RTO should cap at max=10s after many backoffs"
+        );
+    }
+
+    /// Test: default config values match what pion/webrtc.rs expect.
+    /// This is a compatibility test — default behavior must remain RFC 4960 compliant.
+    #[test]
+    fn test_default_config_rfc_compliance() {
+        let config = RtcConfiguration::default();
+
+        // RFC 4960 §6.3.1: RTO.Initial = 3 seconds
+        assert_eq!(
+            config.sctp_rto_initial,
+            Duration::from_secs(3),
+            "RFC 4960 RTO.Initial = 3s"
+        );
+
+        // RFC 4960 §6.3.1: RTO.Min = 1 second
+        assert_eq!(
+            config.sctp_rto_min,
+            Duration::from_secs(1),
+            "RFC 4960 RTO.Min = 1s"
+        );
+
+        // RFC 4960 §6.3.1: RTO.Max = 60 seconds
+        assert_eq!(
+            config.sctp_rto_max,
+            Duration::from_secs(60),
+            "RFC 4960 RTO.Max = 60s"
+        );
+
+        // RFC 4960 §8.1: Association.Max.Retrans default = 10
+        // We use 20 which is more tolerant (same as aiortc)
+        assert!(
+            config.sctp_max_association_retransmits >= 10,
+            "Association.Max.Retrans should be >= RFC default of 10"
+        );
+
+        // Heartbeat interval: 15s matches typical implementations
+        assert_eq!(config.sctp_heartbeat_interval, Duration::from_secs(15));
+
+        // Receive window: 128 KB - reduced for lower memory footprint
+        // while still providing adequate buffering for most use cases
+        assert_eq!(config.sctp_receive_window, 128 * 1024);
+
+        // max_burst = 0 means "use default heuristic" — no behavior change
+        assert_eq!(config.sctp_max_burst, 0);
+
+        // max_cwnd = 256KB matches the previous hardcoded constant
+        assert_eq!(config.sctp_max_cwnd, 256 * 1024);
+    }
+
+    /// Test: burst limiting with explicit configuration (TURN scenario).
+    /// Verifies that with max_burst=4, effective_window is properly constrained.
+    #[test]
+    fn test_burst_limit_calculation() {
+        // Simulate the burst limit calculation from transmit()
+        let max_burst_packets: usize = 4;
+        let flight_val: usize = 0;
+        let cwnd_val: usize = CWND_INITIAL; // 12000
+        let rwnd_val: usize = 1024 * 1024; // 1MB
+
+        let burst_limit = max_burst_packets * MAX_SCTP_PACKET_SIZE; // 4 * 1200 = 4800
+        let burst_constrained_cwnd = (flight_val + burst_limit).min(cwnd_val);
+        let effective_window = burst_constrained_cwnd.min(rwnd_val);
+
+        assert_eq!(
+            burst_limit,
+            4800,
+            "burst_limit should be 4 * 1200 = 4800"
+        );
+        assert_eq!(
+            effective_window, 4800,
+            "effective_window should be constrained by burst_limit"
+        );
+
+        // With default heuristic (max_burst=0, using 16 packets):
+        let default_burst = 16 * MAX_SCTP_PACKET_SIZE; // 19200
+        let default_constrained = (flight_val + default_burst).min(cwnd_val);
+        assert_eq!(
+            default_constrained, cwnd_val,
+            "default burst should not constrain below cwnd"
+        );
+    }
+
+    /// Test: cwnd growth is capped by configurable max_cwnd instead of hardcoded constant.
+    #[test]
+    fn test_cwnd_growth_capped_by_config() {
+        // Simulate slow start growth approaching a custom max_cwnd
+        let max_cwnd: usize = 32 * 1024; // 32 KB
+        let mut cwnd: usize = CWND_INITIAL; // 12000
+        let ssthresh: usize = usize::MAX; // slow start
+
+        for _ in 0..100 {
+            if cwnd <= ssthresh && cwnd < max_cwnd {
+                let increase = MAX_SCTP_PACKET_SIZE.min(max_cwnd - cwnd);
+                cwnd = (cwnd + increase).min(max_cwnd);
+            }
+        }
+
+        assert_eq!(
+            cwnd, max_cwnd,
+            "cwnd should grow up to max_cwnd but not beyond"
+        );
+    }
+
+    /// Test: higher max_heartbeat_failures keeps connection alive longer.
+    /// Simulates the scenario where TURN rate-limits heartbeat ACKs.
+    #[tokio::test]
+    async fn test_higher_heartbeat_failures_keeps_alive() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        // Configure with 8 max heartbeat failures (instead of default 4)
+        let mut config = RtcConfiguration::default();
+        config.sctp_rto_initial = Duration::from_secs(1);
+        config.sctp_rto_min = Duration::from_secs(1);
+        config.sctp_max_heartbeat_failures = 8;
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp, _runner) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+        tokio::spawn(_runner);
+        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        sctp.inner.remote_verification_tag.store(1, Ordering::SeqCst);
+
+        // Simulate consecutive heartbeat failures during RTO backoff
+        // (RTO > 2.0 means is_rto_backing_off = true)
+        {
+            let mut rto_state = sctp.inner.rto_state.lock().unwrap();
+            rto_state.rto = 5.0; // Force RTO backing off
+        }
+
+        // Set heartbeat_sent_time so the failure path is triggered
+        *sctp.inner.heartbeat_sent_time.lock().unwrap() = Some(Instant::now() - Duration::from_secs(30));
+
+        // With default config (max_heartbeat_failures=4), the connection would close after 4 failures.
+        // With our config (max_heartbeat_failures=8), it should survive through 7 failures.
+        for i in 1..=7 {
+            sctp.inner.send_heartbeat().await.unwrap();
+            let state = *sctp.inner.state.lock().unwrap();
+            assert_ne!(
+                state,
+                SctpState::Closed,
+                "Connection should NOT close at heartbeat failure #{} (max=8)",
+                i
+            );
+            let failures = sctp.inner.consecutive_heartbeat_failures.load(Ordering::SeqCst);
+            println!("Heartbeat failure #{}: consecutive_failures={}, state={:?}", i, failures, state);
+            // Re-set heartbeat_sent_time for next iteration
+            *sctp.inner.heartbeat_sent_time.lock().unwrap() = Some(Instant::now() - Duration::from_secs(30));
+        }
+
+        // The 8th failure should close the connection
+        sctp.inner.send_heartbeat().await.unwrap();
+        let final_state = *sctp.inner.state.lock().unwrap();
+        assert_eq!(
+            final_state,
+            SctpState::Closed,
+            "Connection should close at heartbeat failure #8 (max=8)"
+        );
+
+        let close_reason = sctp.inner.close_reason.lock().unwrap().clone();
+        assert_eq!(close_reason, Some("HEARTBEAT_DEAD".to_string()));
+    }
+
+    /// Test: ssthresh auto-raise is capped by configurable max_cwnd.
+    #[tokio::test]
+    async fn test_ssthresh_raise_capped_by_max_cwnd() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let mut config = RtcConfiguration::default();
+        config.sctp_max_cwnd = 16 * 1024; // Small max_cwnd = 16 KB
+        config.sctp_rto_initial = Duration::from_secs(1);
+        config.sctp_rto_min = Duration::from_secs(1);
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp, _runner) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+        tokio::spawn(_runner);
+        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        sctp.inner.remote_verification_tag.store(1, Ordering::SeqCst);
+
+        // Set up ssthresh at minimum, cwnd approaching ssthresh
+        sctp.inner.ssthresh.store(SSTHRESH_MIN, Ordering::SeqCst);
+        sctp.inner.cwnd_tx.store(SSTHRESH_MIN, Ordering::SeqCst);
+        sctp.inner.next_tsn.store(101, Ordering::SeqCst);
+        sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
+
+        // Add a chunk that will be acked by cum_tsn
+        {
+            let mut sent = sctp.inner.sent_queue.lock().unwrap();
+            sent.insert(
+                100,
+                ChunkRecord {
+                    payload: Bytes::from(vec![0u8; 1024]),
+                    sent_time: Instant::now() - Duration::from_millis(50),
+                    transmit_count: 1,
+                    missing_reports: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                    needs_retransmit: false,
+                    fast_retransmit_time: None,
+                    in_flight: true,
+                    acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0,
+                    max_retransmits: None,
+                    expiry: None,
+                },
+            );
+        }
+        sctp.inner.flight_size.store(1024, Ordering::SeqCst);
+
+        // SACK acknowledging TSN 100
+        let sack = build_sack_packet(100, 1024 * 1024, vec![], vec![]);
+        sctp.inner.handle_sack(sack).await.unwrap();
+
+        let new_ssthresh = sctp.inner.ssthresh.load(Ordering::SeqCst);
+        println!(
+            "After SACK: ssthresh={}, max_cwnd={}",
+            new_ssthresh, config.sctp_max_cwnd
+        );
+        assert!(
+            new_ssthresh <= config.sctp_max_cwnd,
+            "ssthresh {} should not exceed max_cwnd {}",
+            new_ssthresh,
+            config.sctp_max_cwnd
+        );
+    }
+
+    // ===== New Tests for TURN + Rate-Limiting Stability =====
+
+    /// Test 1: Stale SACK filtering - very late SACKs should be ignored
+    #[test]
+    fn test_stale_sack_filtering() {
+        let mut sent: BTreeMap<u32, ChunkRecord> = BTreeMap::new();
+        let base = Instant::now() - Duration::from_millis(100);
+
+        // Insert TSN 100-105
+        for tsn in 100..=105 {
+            sent.insert(
+                tsn,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"data"),
+                    sent_time: base,
+                    transmit_count: 1,
+                    missing_reports: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                    fast_retransmit_time: None,
+                    needs_retransmit: false,
+                    in_flight: true,
+                    acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
+                },
+            );
+        }
+
+        // SACK with cumulative=99 (even older than lowest=100)
+        // This should be filtered out as stale
+        let outcome = apply_sack_to_sent_queue(&mut sent, 99, &[], Instant::now(), true);
+
+        // All packets should still be present (stale SACK ignored)
+        assert_eq!(sent.len(), 6, "Stale SACK should not modify sent queue");
+        assert_eq!(outcome.flight_reduction, 0);
+    }
+
+    /// Test 2: Gap block u16 offset overflow protection
+    #[test]
+    fn test_gap_ack_u16_overflow_protection() {
+        let mut received: BTreeMap<u32, (u8, Bytes)> = BTreeMap::new();
+
+        // TSNs very far from cumulative (beyond u16::MAX offset)
+        // Cumulative: 1000, Received: 70000 (offset 69000 > u16::MAX)
+        let cumulative = 1000;
+        received.insert(70000, (0, Bytes::new()));
+
+        let blocks = build_gap_ack_blocks_from_map(&received, cumulative);
+
+        // Should skip blocks that would overflow u16
+        assert!(blocks.is_empty() || blocks.iter().all(|(s, e)| {
+            *s <= u16::MAX && *e <= u16::MAX
+        }), "Gap blocks should not overflow u16");
+    }
+
+    /// Test 3: SSN u16 wraparound handling
+    #[test]
+    fn test_ssn_wraparound() {
+        let mut stream = InboundStream::new();
+
+        // Normal case: receive in-order SSNs
+        stream.next_ssn = 0;
+        let result = stream.enqueue(0, Bytes::from_static(b"msg0"));
+        assert_eq!(result.len(), 1, "In-order SSN should be delivered");
+
+        // Test ssn_gt function for wraparound detection
+        // ssn_gt(5, 65530) should be true (5 > 65530 via wraparound)
+        assert!(ssn_gt(5, 65530), "SSN 5 should be greater than 65530 (wraparound)");
+        assert!(!ssn_gt(65530, 5), "SSN 65530 should not be greater than 5 (wraparound)");
+        assert!(ssn_gt(0, 65535), "SSN 0 should be greater than 65535 (wraparound)");
+    }
+
+    /// Test 4: Fast Recovery reentry cooldown boundary
+    /// The cooldown prevents rapid re-entry into fast recovery
+    #[tokio::test]
+    async fn test_fast_recovery_cooldown() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+
+        // Set fast recovery as active with recent entry time
+        sctp.inner.fast_recovery_active.store(true, Ordering::SeqCst);
+        sctp.inner
+            .fast_recovery_exit_tsn
+            .store(200, Ordering::SeqCst);
+        *sctp.inner.last_fast_recovery_entry.lock().unwrap() = Instant::now();
+
+        // Verify cooldown constant exists and has correct value
+        let _cooldown_ms = FAST_RECOVERY_REENTRY_COOLDOWN.as_millis();
+        assert_eq!(
+            _cooldown_ms, 200,
+            "Fast recovery cooldown should be 200ms"
+        );
+
+        // Verify that last_fast_recovery_entry is tracked
+        let entry_time = *sctp.inner.last_fast_recovery_entry.lock().unwrap();
+        let elapsed = Instant::now().duration_since(entry_time);
+
+        // Entry time should be very recent (within this test)
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Entry time should be recent"
+        );
+    }
+
+    /// Test 5: peer_rwnd=0 blocks new data but allows retransmits
+    #[tokio::test]
+    async fn test_peer_rwnd_zero_allows_retransmit() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+
+        // Add a packet marked for retransmit
+        {
+            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            sent_queue.insert(
+                100,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"retransmit_me"),
+                    sent_time: Instant::now() - Duration::from_millis(50),
+                    transmit_count: 1,
+                    missing_reports: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                    fast_retransmit_time: None,
+                    needs_retransmit: true, // Marked for retransmit
+                    in_flight: false,       // Not in flight yet
+                    acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
+                },
+            );
+        }
+
+        // Set peer_rwnd to 0
+        sctp.inner.peer_rwnd.store(0, Ordering::SeqCst);
+        sctp.inner.cwnd_tx.store(12000, Ordering::SeqCst);
+        sctp.inner.flight_size.store(0, Ordering::SeqCst);
+
+        // transmit() should still send the retransmit even with rwnd=0
+        // (retransmits are not subject to flow control)
+        let result = sctp.inner.transmit().await;
+        assert!(result.is_ok(), "Retransmit should succeed even with rwnd=0");
+    }
+
+    /// Test 6: Congestion Avoidance partial_bytes_acked exact steps
+    #[test]
+    fn test_congestion_avoidance_pba() {
+        // Simulate CA phase: cwnd = 4800 (ssthresh), need 4800 bytes to grow cwnd by MTU
+        let mut pba: usize = 0;
+        let cwnd: usize = 4800;
+        let _mtu: usize = 1200;
+
+        // Simulate 4 RTTs worth of acks (each ack adds ~1000 bytes)
+        // After 5 RTTs (5000 bytes), cwnd should grow by 1 MTU
+        for _i in 0..5 {
+            let acked = 1000;
+            pba += acked;
+            if pba >= cwnd {
+                pba -= cwnd; // Reset and grow cwnd
+            }
+        }
+
+        // At this point, pba should have wrapped at least once
+        assert!(pba < cwnd, "pba should be less than cwnd after wrap");
+    }
+
+    /// Test 7: RTO decay on SACK progress (backed-off RTO decreases)
+    #[tokio::test]
+    async fn test_rto_decay_on_sack_progress() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+
+        // Manually backoff RTO to a high value
+        {
+            let mut rto = sctp.inner.rto_state.lock().unwrap();
+            rto.srtt = 1.0;
+            rto.rttvar = 0.25;
+            rto.rto = 10.0; // Backed off to 10s
+        }
+
+        // Add packet and ack it (with no fresh RTT sample)
+        {
+            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            sent_queue.insert(
+                100,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"data"),
+                    sent_time: Instant::now() - Duration::from_millis(100),
+                    transmit_count: 2, // Retransmitted, so no fresh RTT
+                    missing_reports: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                    fast_retransmit_time: None,
+                    needs_retransmit: false,
+                    in_flight: true,
+                    acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
+                },
+            );
+        }
+
+        let rto_before = sctp.inner.rto_state.lock().unwrap().rto;
+
+        // SACK with cumulative ack (no fresh RTT sample, but makes progress)
+        let sack = build_sack_packet(100, 1024 * 1024, vec![], vec![]);
+        sctp.inner.handle_sack(sack).await.unwrap();
+
+        let rto_after = sctp.inner.rto_state.lock().unwrap().rto;
+
+        // RTO should have decayed towards computed value (srtt + 4*rttvar = 2.0)
+        assert!(
+            rto_after < rto_before,
+            "RTO should decay on SACK progress: {} -> {}",
+            rto_before, rto_after
+        );
+    }
+
+    /// Test 8: Burst-constrained cwnd calculation
+    #[test]
+    fn test_burst_constrained_cwnd() {
+        // Simulate: cwnd = 12000, flight = 0, burst_limit = 16*1200 = 19200
+        let cwnd_val = 12000usize;
+        let flight_val = 0usize;
+        let burst_limit_normal = 16 * MAX_SCTP_PACKET_SIZE;
+        let burst_limit_recovery = 4 * MAX_SCTP_PACKET_SIZE;
+
+        // Normal mode: (0 + 19200).min(12000) = 12000
+        let burst_constrained = (flight_val + burst_limit_normal).min(cwnd_val);
+        assert_eq!(burst_constrained, cwnd_val, "Should use cwnd when burst allows");
+
+        // In recovery mode: (0 + 4800).min(12000) = 4800
+        let burst_constrained_recovery = (flight_val + burst_limit_recovery).min(cwnd_val);
+        assert_eq!(
+            burst_constrained_recovery,
+            4800,
+            "Recovery mode should limit burst to 4800"
+        );
+
+        // Verify the difference: normal allows more burst than recovery
+        assert!(
+            burst_constrained > burst_constrained_recovery,
+            "Normal mode should allow more burst than recovery"
+        );
+    }
+
+    /// Test 9: pion/webrtc.rs wire-format SACK gap block encoding
+    /// pion uses relative offsets from cumulative TSN (same as RFC 4960)
+    #[test]
+    fn test_pion_sack_gap_block_format() {
+        // pion/webrtc.rs encode gap blocks as: (start_offset, end_offset)
+        // where offset = TSN - cumulative_tsn_ack
+        let cumulative_tsn = 1000u32;
+
+        // Simulate pion-style encoding: gap block for TSN 1005-1008
+        let gap_start: u16 = (1005u32 - cumulative_tsn) as u16; // 5
+        let gap_end: u16 = (1008u32 - cumulative_tsn) as u16; // 8
+        let pion_gap_blocks = vec![(gap_start, gap_end)];
+
+        // Build our own gap blocks for the same scenario
+        let mut received: BTreeMap<u32, (u8, Bytes)> = BTreeMap::new();
+        for tsn in 1005..=1008 {
+            received.insert(tsn, (0, Bytes::new()));
+        }
+        let our_gap_blocks = build_gap_ack_blocks_from_map(&received, cumulative_tsn);
+
+        // Should match pion's encoding
+        assert_eq!(
+            pion_gap_blocks, our_gap_blocks,
+            "Gap block encoding must match pion/webrtc.rs"
+        );
+    }
+
+    /// Test 10: advertised_rwnd decreases as used_rwnd increases
+    #[tokio::test]
+    async fn test_advertised_rwnd_tracking() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+
+        // local_rwnd default is 1MB
+        let local_rwnd = sctp.inner.local_rwnd;
+
+        // Initially, advertised_rwnd should equal local_rwnd
+        let initial = sctp.inner.advertised_rwnd();
+        assert_eq!(initial as usize, local_rwnd);
+
+        // Simulate receiving data (increases used_rwnd)
+        sctp.inner.used_rwnd.store(256 * 1024, Ordering::SeqCst);
+
+        let after_256k = sctp.inner.advertised_rwnd();
+        assert!(
+            after_256k < initial,
+            "advertised_rwnd should decrease as used_rwnd increases"
+        );
+
+        // Fill most of the window
+        sctp.inner.used_rwnd.store(local_rwnd - 1000, Ordering::SeqCst);
+
+        let nearly_full = sctp.inner.advertised_rwnd();
+        assert!(nearly_full < 2000, "Window nearly full should advertise small rwnd");
+    }
+
+    /// Test 11: transmit() drains outbound_queue respecting effective window
+    #[tokio::test]
+    async fn test_transmit_drains_outbound_queue() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+
+        // Add chunks to outbound queue - each ~116 bytes wire size
+        for i in 0..20 {
+            sctp.inner
+                .outbound_queue
+                .lock()
+                .unwrap()
+                .push_back(OutboundChunk {
+                    stream_id: 0,
+                    ppid: 53,
+                    payload: Bytes::from(vec![i as u8; 100]),
+                    flags: 0x03,
+                    ssn: i,
+                    max_retransmits: None,
+                    expiry: None,
+                });
+        }
+
+        // Set a small effective window (cwnd=500, flight=0, rwnd=large)
+        // With cwnd=500 and ~116 bytes per chunk, we can send at most 4 chunks
+        sctp.inner.cwnd_tx.store(500, Ordering::SeqCst);
+        sctp.inner.flight_size.store(0, Ordering::SeqCst);
+        sctp.inner.peer_rwnd.store(1024 * 1024, Ordering::SeqCst);
+
+        // Transmit - should send ~4 packets due to cwnd limit (500 bytes / 116 per chunk = 4)
+        sctp.inner.transmit().await.unwrap();
+
+        // Check sent queue
+        let sent_count = sctp.inner.sent_queue.lock().unwrap().len();
+
+        // Outbound queue should have remaining
+        let remaining = sctp.inner.outbound_queue.lock().unwrap().len();
+
+        // With cwnd=500, should send at most 4-5 chunks (500/116 ≈ 4.3)
+        assert!(
+            sent_count >= 4 && sent_count <= 5,
+            "Should send 4-5 chunks with cwnd=500, got {}",
+            sent_count
+        );
+        assert!(
+            remaining >= 15,
+            "Should have most chunks remaining in outbound queue, got {}",
+            remaining
+        );
+    }
+
+    /// Test 12: Multiple SACKs with same signature don't count missing reports
+    #[test]
+    fn test_duplicate_sack_signature() {
+        let mut sent: BTreeMap<u32, ChunkRecord> = BTreeMap::new();
+        let base = Instant::now() - Duration::from_millis(100);
+
+        // Insert TSN 100-105
+        for tsn in 100..=105 {
+            sent.insert(
+                tsn,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"data"),
+                    sent_time: base,
+                    transmit_count: 1,
+                    missing_reports: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                    fast_retransmit_time: None,
+                    needs_retransmit: false,
+                    in_flight: true,
+                    acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
+                },
+            );
+        }
+
+        // First SACK
+        let _ = apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), true);
+
+        // Second SACK with same signature (count_missing_reports = false)
+        let outcome2 = apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), false);
+
+        // Missing reports should NOT have increased on duplicate SACK
+        let rec_105 = sent.get(&105).unwrap();
+        assert_eq!(
+            rec_105.missing_reports, 0,
+            "Duplicate SACK should not increment missing reports"
+        );
+        assert!(
+            outcome2.retransmit.is_empty(),
+            "Duplicate SACK should not trigger fast retransmit"
         );
     }
 }

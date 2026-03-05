@@ -282,6 +282,10 @@ pub struct RtcConfiguration {
     pub sctp_rto_max: std::time::Duration,
     pub sctp_max_association_retransmits: u32,
     pub sctp_receive_window: usize,
+    pub sctp_heartbeat_interval: std::time::Duration,
+    pub sctp_max_heartbeat_failures: u32,
+    pub sctp_max_burst: usize,
+    pub sctp_max_cwnd: usize,
     pub dtls_buffer_size: usize,
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
@@ -313,7 +317,11 @@ impl Default for RtcConfiguration {
             sctp_rto_min: std::time::Duration::from_secs(1),
             sctp_rto_max: std::time::Duration::from_secs(60),
             sctp_max_association_retransmits: 20,
-            sctp_receive_window: 1024 * 1024,
+            sctp_receive_window: 128 * 1024, // 128KB - reduced for lower memory footprint
+            sctp_heartbeat_interval: std::time::Duration::from_secs(15),
+            sctp_max_heartbeat_failures: 4,
+            sctp_max_burst: 0, // 0 = use default heuristic
+            sctp_max_cwnd: 256 * 1024, // 256 KB
             dtls_buffer_size: 2048,
             rtp_start_port: None,
             rtp_end_port: None,
@@ -427,6 +435,62 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    pub fn sctp_rto_initial(mut self, duration: std::time::Duration) -> Self {
+        self.inner.sctp_rto_initial = duration;
+        self
+    }
+
+    pub fn sctp_rto_min(mut self, duration: std::time::Duration) -> Self {
+        self.inner.sctp_rto_min = duration;
+        self
+    }
+
+    pub fn sctp_rto_max(mut self, duration: std::time::Duration) -> Self {
+        self.inner.sctp_rto_max = duration;
+        self
+    }
+
+    pub fn sctp_max_association_retransmits(mut self, count: u32) -> Self {
+        self.inner.sctp_max_association_retransmits = count;
+        self
+    }
+
+    pub fn sctp_receive_window(mut self, size: usize) -> Self {
+        self.inner.sctp_receive_window = size;
+        self
+    }
+
+    pub fn sctp_heartbeat_interval(mut self, duration: std::time::Duration) -> Self {
+        self.inner.sctp_heartbeat_interval = duration;
+        self
+    }
+
+    pub fn sctp_max_heartbeat_failures(mut self, count: u32) -> Self {
+        self.inner.sctp_max_heartbeat_failures = count;
+        self
+    }
+
+    /// Set the maximum burst size for SCTP in number of MTU-sized packets.
+    /// 0 means use the default heuristic (16 packets normal, 4 in recovery).
+    /// For rate-limited TURN relays, a value of 2-4 can reduce burst-induced
+    /// packet loss.
+    pub fn sctp_max_burst(mut self, packets: usize) -> Self {
+        self.inner.sctp_max_burst = packets;
+        self
+    }
+
+    /// Set the maximum congestion window size in bytes.
+    /// Default is 256 KB. For high-latency TURN relays, consider 512KB-1MB.
+    pub fn sctp_max_cwnd(mut self, size: usize) -> Self {
+        self.inner.sctp_max_cwnd = size;
+        self
+    }
+
+    pub fn ice_connection_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner.ice_connection_timeout = timeout;
+        self
+    }
+
     pub fn build(self) -> RtcConfiguration {
         self.inner
     }
@@ -451,6 +515,10 @@ mod tests {
         assert_eq!(config.sctp_rto_min, Duration::from_secs(1));
         assert_eq!(config.sctp_rto_max, Duration::from_secs(60));
         assert_eq!(config.sctp_max_association_retransmits, 20);
+        assert_eq!(config.sctp_heartbeat_interval, Duration::from_secs(15));
+        assert_eq!(config.sctp_max_heartbeat_failures, 4);
+        assert_eq!(config.sctp_max_burst, 0);
+        assert_eq!(config.sctp_max_cwnd, 256 * 1024);
     }
 
     #[test]
@@ -461,5 +529,56 @@ mod tests {
         assert_eq!(config.stun_timeout, Duration::from_secs(10));
         // Verify other defaults are still there
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_sctp_builder_methods() {
+        let config = RtcConfigurationBuilder::new()
+            .sctp_rto_initial(Duration::from_millis(500))
+            .sctp_rto_min(Duration::from_millis(200))
+            .sctp_rto_max(Duration::from_secs(10))
+            .sctp_max_association_retransmits(30)
+            .sctp_receive_window(512 * 1024)
+            .sctp_heartbeat_interval(Duration::from_secs(10))
+            .sctp_max_heartbeat_failures(8)
+            .sctp_max_burst(4)
+            .sctp_max_cwnd(512 * 1024)
+            .ice_connection_timeout(Duration::from_secs(60))
+            .build();
+
+        assert_eq!(config.sctp_rto_initial, Duration::from_millis(500));
+        assert_eq!(config.sctp_rto_min, Duration::from_millis(200));
+        assert_eq!(config.sctp_rto_max, Duration::from_secs(10));
+        assert_eq!(config.sctp_max_association_retransmits, 30);
+        assert_eq!(config.sctp_receive_window, 512 * 1024);
+        assert_eq!(config.sctp_heartbeat_interval, Duration::from_secs(10));
+        assert_eq!(config.sctp_max_heartbeat_failures, 8);
+        assert_eq!(config.sctp_max_burst, 4);
+        assert_eq!(config.sctp_max_cwnd, 512 * 1024);
+        assert_eq!(config.ice_connection_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_turn_optimized_config() {
+        // Verify a TURN-optimized configuration can be expressed cleanly
+        let config = RtcConfigurationBuilder::new()
+            .sctp_rto_initial(Duration::from_millis(500))
+            .sctp_rto_min(Duration::from_millis(200))
+            .sctp_rto_max(Duration::from_secs(10))
+            .sctp_max_association_retransmits(30)
+            .sctp_max_heartbeat_failures(8)
+            .sctp_max_burst(4)
+            .stun_timeout(Duration::from_secs(10))
+            .nomination_timeout(Duration::from_secs(20))
+            .build();
+
+        // Verify the TURN-optimized values are more aggressive than defaults
+        let defaults = RtcConfiguration::default();
+        assert!(config.sctp_rto_initial < defaults.sctp_rto_initial);
+        assert!(config.sctp_rto_min < defaults.sctp_rto_min);
+        assert!(config.sctp_rto_max < defaults.sctp_rto_max);
+        assert!(config.sctp_max_association_retransmits > defaults.sctp_max_association_retransmits);
+        assert!(config.sctp_max_heartbeat_failures > defaults.sctp_max_heartbeat_failures);
+        assert!(config.sctp_max_burst > 0); // Explicit burst limit vs. heuristic
     }
 }
