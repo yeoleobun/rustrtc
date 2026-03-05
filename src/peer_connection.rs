@@ -951,6 +951,12 @@ impl PeerConnection {
                             break;
                         }
                     }
+
+                    if found_transceiver.is_none() && mid.is_empty() {
+                        if let Some(t) = transceivers.iter().find(|t| t.kind() == section.kind) {
+                            found_transceiver = Some(t.clone());
+                        }
+                    }
                 }
 
                 let mut ssrc = None;
@@ -1982,7 +1988,15 @@ impl PeerConnection {
             // Find matching transceiver by mid
             let transceiver = transceivers
                 .iter()
-                .find(|t| t.mid().as_ref() == Some(&section.mid));
+                .find(|t| t.mid().as_ref() == Some(&section.mid))
+                .or_else(|| {
+                    if section.mid.is_empty() {
+                        // MID-less re-INVITE fallback: match by kind.
+                        transceivers.iter().find(|t| t.kind() == section.kind)
+                    } else {
+                        None
+                    }
+                });
 
             if let Some(t) = transceiver {
                 // Check SSRC change (indicates new track, not reinvite)
@@ -2724,18 +2738,42 @@ impl PeerConnectionInner {
             }
 
             let mut ordered = Vec::new();
+            let mut used_indices = std::collections::HashSet::new();
             for section in &remote.media_sections {
                 let mid = &section.mid;
-                let mut found = None;
-                for t in &transceivers {
-                    if let Some(t_mid) = t.mid()
-                        && t_mid == *mid
-                    {
-                        found = Some(t.clone());
-                        break;
+                let mut found: Option<(usize, Arc<RtpTransceiver>)> = None;
+
+                // 1) Prefer exact MID match when remote provides MID.
+                if !mid.is_empty() {
+                    for (idx, t) in transceivers.iter().enumerate() {
+                        if used_indices.contains(&idx) {
+                            continue;
+                        }
+                        if let Some(t_mid) = t.mid()
+                            && t_mid == *mid
+                        {
+                            found = Some((idx, t.clone()));
+                            break;
+                        }
                     }
                 }
-                if let Some(t) = found {
+
+                // 2) Interop fallback for MID-less sections:
+                // pick first unused same-kind transceiver.
+                if found.is_none() && mid.is_empty() {
+                    for (idx, t) in transceivers.iter().enumerate() {
+                        if used_indices.contains(&idx) {
+                            continue;
+                        }
+                        if t.kind() == section.kind {
+                            found = Some((idx, t.clone()));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((idx, t)) = found {
+                    used_indices.insert(idx);
                     ordered.push(t);
                 } else {
                     return Err(RtcError::Internal(format!(
