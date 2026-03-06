@@ -1080,3 +1080,240 @@ async fn test_nomination_succeeds_under_moderate_packet_loss() -> Result<()> {
 
     result
 }
+
+// ============================================================================
+// Tests for external_ip and base_address() functionality
+// ============================================================================
+
+/// Test that `base_address()` returns the related_address for host candidates
+/// when related_address is set (which happens when external_ip is configured).
+#[test]
+fn test_base_address_returns_related_address_for_host_candidate() {
+    let local_addr: SocketAddr = "192.168.1.100:54321".parse().unwrap();
+    let external_addr: SocketAddr = "203.0.113.5:54321".parse().unwrap();
+
+    let mut candidate = IceCandidate::host(external_addr, 1);
+    candidate.related_address = Some(local_addr);
+
+    // base_address() should return the related_address (local socket address)
+    assert_eq!(
+        candidate.base_address(),
+        local_addr,
+        "base_address() should return related_address for host candidate with external IP"
+    );
+
+    // address should still be the external address
+    assert_eq!(
+        candidate.address,
+        external_addr,
+        "address should be the external IP"
+    );
+}
+
+/// Test that `base_address()` returns the address when related_address is None.
+#[test]
+fn test_base_address_returns_address_when_no_related_address() {
+    let addr: SocketAddr = "192.168.1.100:54321".parse().unwrap();
+    let candidate = IceCandidate::host(addr, 1);
+
+    assert_eq!(
+        candidate.base_address(),
+        addr,
+        "base_address() should return address when related_address is None"
+    );
+}
+
+/// Test that ICE connection works when external_ip is configured.
+/// This tests the fix for the bug where local candidate lookup used
+/// `c.address` instead of `c.base_address()`.
+#[tokio::test]
+#[serial]
+async fn test_ice_connection_with_external_ip() -> Result<()> {
+    // Configure both sides with a dummy external IP
+    // Using 203.0.113.x which is in the TEST-NET-3 range (documentation purpose)
+    let mut config1 = RtcConfiguration::default();
+    config1.external_ip = Some("203.0.113.10".to_string());
+
+    let mut config2 = RtcConfiguration::default();
+    config2.external_ip = Some("203.0.113.20".to_string());
+
+    let (controlling, controlled) = setup_host_pair(config1, config2).await;
+
+    // Verify that candidates have related_address set
+    let ctrl_candidates = controlling.local_candidates();
+    let non_loopback_candidate = ctrl_candidates
+        .iter()
+        .find(|c| !c.address.ip().is_loopback());
+
+    if let Some(cand) = non_loopback_candidate {
+        assert!(
+            cand.related_address.is_some(),
+            "Host candidate should have related_address when external_ip is configured"
+        );
+        assert_ne!(
+            cand.address.ip(),
+            cand.base_address().ip(),
+            "Candidate address (external) should differ from base_address (local)"
+        );
+    }
+
+    let ctrl_state = controlling.subscribe_state();
+    let ctrd_state = controlled.subscribe_state();
+
+    // Both sides should reach Connected within 10 s
+    let (ok1, ok2) = tokio::join!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)),
+        wait_ice_connected(ctrd_state, Duration::from_secs(10)),
+    );
+    assert!(ok1, "Controlling agent failed to reach Connected with external_ip");
+    assert!(ok2, "Controlled agent failed to reach Connected with external_ip");
+
+    // Verify selected pair exists
+    let selected_pair = controlling.get_selected_pair().await;
+    assert!(
+        selected_pair.is_some(),
+        "Controlling agent should have a selected pair"
+    );
+
+    let selected_pair = controlled.get_selected_pair().await;
+    assert!(
+        selected_pair.is_some(),
+        "Controlled agent should have a selected pair"
+    );
+
+    Ok(())
+}
+
+/// Test that nomination_complete fires correctly when external_ip is configured.
+#[tokio::test]
+#[serial]
+async fn test_nomination_with_external_ip() -> Result<()> {
+    let mut config1 = RtcConfiguration::default();
+    config1.external_ip = Some("203.0.113.10".to_string());
+
+    let mut config2 = RtcConfiguration::default();
+    config2.external_ip = Some("203.0.113.20".to_string());
+
+    let (controlling, controlled) = setup_host_pair(config1, config2).await;
+
+    let mut ctrl_nom_rx = controlling.subscribe_nomination_complete();
+    let mut ctrd_nom_rx = controlled.subscribe_nomination_complete();
+
+    let ctrl_state = controlling.subscribe_state();
+    let ctrd_state = controlled.subscribe_state();
+
+    // Wait for connection
+    let (ok1, ok2) = tokio::join!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)),
+        wait_ice_connected(ctrd_state, Duration::from_secs(10)),
+    );
+    assert!(ok1, "Controlling agent failed to connect");
+    assert!(ok2, "Controlled agent failed to connect");
+
+    // Wait for nomination signals
+    let ctrl_nom = timeout(Duration::from_secs(15), async {
+        if ctrl_nom_rx.borrow().is_some() {
+            return *ctrl_nom_rx.borrow();
+        }
+        ctrl_nom_rx.changed().await.ok()?;
+        *ctrl_nom_rx.borrow()
+    })
+    .await
+    .expect("Controlling nomination_complete should fire");
+
+    let ctrd_nom = timeout(Duration::from_secs(5), async {
+        if ctrd_nom_rx.borrow().is_some() {
+            return *ctrd_nom_rx.borrow();
+        }
+        ctrd_nom_rx.changed().await.ok()?;
+        *ctrd_nom_rx.borrow()
+    })
+    .await
+    .expect("Controlled nomination_complete should fire");
+
+    // Controlled side should signal immediately
+    assert_eq!(
+        ctrd_nom,
+        Some(true),
+        "Controlled side should signal nomination_complete immediately"
+    );
+
+    // Controlling side may succeed or fail depending on whether nomination reaches the peer
+    // The key is that it should fire (not remain None)
+    assert!(
+        ctrl_nom.is_some(),
+        "Controlling nomination_complete should fire (got {:?})",
+        ctrl_nom
+    );
+
+    Ok(())
+}
+
+/// Test that ICE connection works WITHOUT external_ip configured.
+/// This ensures the fix for external_ip doesn't break the normal case.
+#[tokio::test]
+#[serial]
+async fn test_ice_connection_without_external_ip() -> Result<()> {
+    // Default config has no external_ip
+    let config1 = RtcConfiguration::default();
+    let config2 = RtcConfiguration::default();
+
+    let (controlling, controlled) = setup_host_pair(config1, config2).await;
+
+    // Verify that host candidates do NOT have related_address (or it matches address)
+    let ctrl_candidates = controlling.local_candidates();
+    for cand in &ctrl_candidates {
+        if cand.typ == IceCandidateType::Host {
+            // Without external_ip, related_address should be None for non-loopback
+            // or the same as address
+            if let Some(related) = cand.related_address {
+                assert_eq!(
+                    related, cand.address,
+                    "Without external_ip, related_address should equal address"
+                );
+            }
+            // base_address() should equal address
+            assert_eq!(
+                cand.base_address(),
+                cand.address,
+                "Without external_ip, base_address() should equal address"
+            );
+        }
+    }
+
+    let ctrl_state = controlling.subscribe_state();
+    let ctrd_state = controlled.subscribe_state();
+
+    // Both sides should reach Connected within 10 s
+    let (ok1, ok2) = tokio::join!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)),
+        wait_ice_connected(ctrd_state, Duration::from_secs(10)),
+    );
+    assert!(ok1, "Controlling agent failed to reach Connected without external_ip");
+    assert!(ok2, "Controlled agent failed to reach Connected without external_ip");
+
+    // Verify selected pair exists and is valid
+    let ctrl_pair = controlling.get_selected_pair().await;
+    assert!(
+        ctrl_pair.is_some(),
+        "Controlling agent should have a selected pair"
+    );
+    let pair = ctrl_pair.unwrap();
+    // Verify the pair addresses match what we expect
+    assert!(
+        pair.local.address.port() > 0,
+        "Local address should have valid port"
+    );
+    assert!(
+        pair.remote.address.port() > 0,
+        "Remote address should have valid port"
+    );
+
+    let ctrd_pair = controlled.get_selected_pair().await;
+    assert!(
+        ctrd_pair.is_some(),
+        "Controlled agent should have a selected pair"
+    );
+
+    Ok(())
+}

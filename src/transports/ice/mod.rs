@@ -1375,7 +1375,7 @@ async fn handle_stun_request(
             };
 
             let locals = inner.gatherer.local_candidates();
-            let local_cand = locals.iter().find(|c| c.address == local_addr);
+            let local_cand = locals.iter().find(|c| c.base_address() == local_addr);
 
             let pair = {
                 let remotes = inner.remote_candidates.lock().unwrap();
