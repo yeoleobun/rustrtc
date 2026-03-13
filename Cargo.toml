@@ -45,6 +45,7 @@ crc32c = "0.6"
 base64 = "0.22.1"
 network-interface = "2"
 rand = "0.9.2"
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["multipart"] }

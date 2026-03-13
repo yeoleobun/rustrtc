@@ -268,8 +268,6 @@ fn normalize_fingerprint_value(value: &str) -> SdpResult<String> {
 
     Ok(formatted)
 }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSection {
     pub version: u8,
