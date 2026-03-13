@@ -2804,7 +2804,10 @@ impl PeerConnectionInner {
 
                 if let Some((idx, t)) = found {
                     used_indices.insert(idx);
-                    ordered.push(t);
+                    ordered.push((
+                        t,
+                        section.attributes.iter().any(|attr| attr.key == "rtcp-mux"),
+                    ));
                 } else {
                     return Err(RtcError::Internal(format!(
                         "No transceiver found for mid {} in answer generation",
@@ -2833,7 +2836,7 @@ impl PeerConnectionInner {
                     _ => mid_a.cmp(&mid_b),
                 }
             });
-            ordered
+            ordered.into_iter().map(|t| (t, false)).collect()
         };
 
         let mode = self.config.transport_mode.clone();
@@ -2917,7 +2920,7 @@ impl PeerConnectionInner {
             }
         }
 
-        for transceiver in ordered_transceivers.into_iter() {
+        for (transceiver, remote_offered_rtcp_mux) in ordered_transceivers.into_iter() {
             let mid = self.ensure_mid(&transceiver);
             let mut direction = map_direction(transceiver.direction());
             let sender_info = if direction.sends() {
@@ -3038,6 +3041,9 @@ impl PeerConnectionInner {
             }
 
             self.populate_media_capabilities(&mut section, transceiver.kind(), sdp_type);
+            if sdp_type == SdpType::Answer && !remote_offered_rtcp_mux {
+                section.attributes.retain(|attr| attr.key != "rtcp-mux");
+            }
             if let Some(sender) = sender_info {
                 Self::attach_sender_attributes(
                     &mut section,
@@ -5899,6 +5905,50 @@ a=mid:0
         assert!(
             sdp.contains("rtcp-mux"),
             "Require policy should include rtcp-mux in offer SDP, got:\n{}",
+            sdp
+        );
+    }
+
+    #[tokio::test]
+    async fn rtp_mode_answer_omits_rtcp_mux_when_offer_omits_it() {
+        use crate::{RtcpMuxPolicy, TransportMode};
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.rtcp_mux_policy = RtcpMuxPolicy::Require;
+
+        let pc = PeerConnection::new(config);
+        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
+        let params = RtpCodecParameters {
+            payload_type: 0,
+            clock_rate: 8000,
+            channels: 1,
+        };
+        let sender = RtpSender::builder(track, 100)
+            .stream_id("s".to_string())
+            .params(params)
+            .build();
+        transceiver.set_sender(Some(sender));
+
+        let remote_offer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
+        pc.set_remote_description(desc).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        let sdp = answer.to_sdp_string();
+
+        assert!(
+            !sdp.contains("a=rtcp-mux"),
+            "Answer must not advertise rtcp-mux when the remote offer omitted it, got:\n{}",
             sdp
         );
     }
