@@ -14,7 +14,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use core::fmt;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{SigningKey, signature::RandomizedSigner};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::RandomizedSigner};
 use p256::pkcs8::DecodePrivateKey;
 use p256::{PublicKey, ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint};
 use rand_core::OsRng;
@@ -23,6 +23,9 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use x509_parser::certificate::X509Certificate;
+use x509_parser::prelude::FromDer;
+use x509_parser::public_key::PublicKey as X509PublicKey;
 
 use self::handshake::{
     CertificateMessage, ClientHello, ClientKeyExchange, Finished, HandshakeMessage, HandshakeType,
@@ -45,14 +48,60 @@ pub fn generate_certificate() -> Result<Certificate> {
 }
 
 pub fn fingerprint(cert: &Certificate) -> String {
+    fingerprint_from_der(&cert.certificate[0])
+}
+
+pub(crate) fn fingerprint_from_der(certificate_der: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(&cert.certificate[0]);
+    hasher.update(certificate_der);
     let result = hasher.finalize();
     result
         .iter()
         .map(|b| format!("{:02X}", b))
         .collect::<Vec<String>>()
         .join(":")
+}
+
+fn certificate_public_key(certificate_der: &[u8]) -> Result<VerifyingKey> {
+    let (_, certificate) = X509Certificate::from_der(certificate_der)
+        .map_err(|e| anyhow::anyhow!("Failed to parse DTLS certificate: {:?}", e))?;
+
+    match certificate
+        .public_key()
+        .parsed()
+        .map_err(|e| anyhow::anyhow!("Failed to parse certificate public key: {:?}", e))?
+    {
+        X509PublicKey::EC(point) => VerifyingKey::from_sec1_bytes(point.data())
+            .map_err(|e| anyhow::anyhow!("Unsupported DTLS certificate EC key: {}", e)),
+        _ => Err(anyhow::anyhow!(
+            "Unsupported DTLS certificate public key algorithm"
+        )),
+    }
+}
+
+pub(crate) fn verify_server_key_exchange_signature(
+    certificate_der: &[u8],
+    client_random: &[u8],
+    server_random: &[u8],
+    server_key_exchange: &ServerKeyExchange,
+) -> Result<()> {
+    let verifying_key = certificate_public_key(certificate_der)?;
+    let signature = Signature::from_der(&server_key_exchange.signature)
+        .map_err(|e| anyhow::anyhow!("Invalid ServerKeyExchange signature format: {}", e))?;
+
+    let mut signed_params = Vec::with_capacity(
+        client_random.len() + server_random.len() + 4 + server_key_exchange.public_key.len(),
+    );
+    signed_params.extend_from_slice(client_random);
+    signed_params.extend_from_slice(server_random);
+    signed_params.push(server_key_exchange.curve_type);
+    signed_params.extend_from_slice(&server_key_exchange.named_curve.to_be_bytes());
+    signed_params.push(server_key_exchange.public_key.len() as u8);
+    signed_params.extend_from_slice(&server_key_exchange.public_key);
+
+    verifying_key
+        .verify(&signed_params, &signature)
+        .map_err(|e| anyhow::anyhow!("ServerKeyExchange signature verification failed: {}", e))
 }
 
 pub fn get_client_hello_extensions() -> Vec<u8> {
@@ -118,6 +167,7 @@ struct DtlsInner {
     write_seq: AtomicU64,
     write_epoch: AtomicU16,
     is_client: bool,
+    expected_remote_fingerprint: Option<String>,
 }
 
 pub struct DtlsTransport {
@@ -169,6 +219,7 @@ impl DtlsTransport {
         certificate: Certificate,
         is_client: bool,
         _buffer_size: usize,
+        expected_remote_fingerprint: Option<String>,
     ) -> Result<(
         Arc<Self>,
         mpsc::UnboundedReceiver<Bytes>,
@@ -187,6 +238,7 @@ impl DtlsTransport {
             write_seq: AtomicU64::new(0),
             write_epoch: AtomicU16::new(0),
             is_client,
+            expected_remote_fingerprint,
         });
 
         let close_tx = Arc::new(tokio::sync::Notify::new());
@@ -675,7 +727,9 @@ impl DtlsInner {
             HandshakeType::ServerHello => {
                 self.handle_server_hello(msg, ctx, is_client)?;
             }
-            HandshakeType::Certificate => {}
+            HandshakeType::Certificate => {
+                self.handle_certificate(msg, ctx).await?;
+            }
             HandshakeType::ServerKeyExchange => {
                 self.handle_server_key_exchange(msg, ctx, is_client)?;
             }
@@ -687,6 +741,44 @@ impl DtlsInner {
         Ok(())
     }
 
+    async fn handle_certificate(
+        &self,
+        msg: HandshakeMessage,
+        ctx: &mut HandshakeContext,
+    ) -> Result<()> {
+        let mut body = msg.body.clone();
+        let certificate = CertificateMessage::decode(&mut body)?;
+        let Some(leaf_certificate) = certificate.certificates.first() else {
+            *self.state.lock().unwrap() = DtlsState::Failed;
+            let _ = self.state_tx.send(DtlsState::Failed);
+            return Err(anyhow::anyhow!(
+                "DTLS certificate message did not contain a leaf certificate"
+            ));
+        };
+
+        // Compare the certificate hash to SDP before accepting any key material from it.
+        let actual_fingerprint = fingerprint_from_der(leaf_certificate);
+        if let Some(expected_fingerprint) = &ctx.expected_remote_fingerprint
+            && &actual_fingerprint != expected_fingerprint
+        {
+            *self.state.lock().unwrap() = DtlsState::Failed;
+            let _ = self.state_tx.send(DtlsState::Failed);
+            return Err(anyhow::anyhow!(
+                "DTLS fingerprint mismatch: expected {}, got {}",
+                expected_fingerprint,
+                actual_fingerprint
+            ));
+        }
+
+        if let Err(e) = certificate_public_key(leaf_certificate) {
+            *self.state.lock().unwrap() = DtlsState::Failed;
+            let _ = self.state_tx.send(DtlsState::Failed);
+            return Err(e);
+        }
+        ctx.peer_certificate = Some(leaf_certificate.clone());
+
+        Ok(())
+    }
     async fn handle_client_hello(
         &self,
         msg: HandshakeMessage,
@@ -1355,7 +1447,35 @@ impl DtlsInner {
         if is_client {
             let mut body = msg.body.clone();
             if let Ok(server_key_exchange) = ServerKeyExchange::decode(&mut body) {
+                let Some(peer_certificate) = ctx.peer_certificate.as_deref() else {
+                    *self.state.lock().unwrap() = DtlsState::Failed;
+                    let _ = self.state_tx.send(DtlsState::Failed);
+                    return Err(anyhow::anyhow!(
+                        "Received ServerKeyExchange before a verifiable DTLS certificate"
+                    ));
+                };
+                let (Some(client_random), Some(server_random)) =
+                    (&ctx.client_random, &ctx.server_random)
+                else {
+                    *self.state.lock().unwrap() = DtlsState::Failed;
+                    let _ = self.state_tx.send(DtlsState::Failed);
+                    return Err(anyhow::anyhow!(
+                        "Missing DTLS random values for ServerKeyExchange verification"
+                    ));
+                };
+
+                if let Err(e) = verify_server_key_exchange_signature(
+                    peer_certificate,
+                    client_random,
+                    server_random,
+                    &server_key_exchange,
+                ) {
+                    *self.state.lock().unwrap() = DtlsState::Failed;
+                    let _ = self.state_tx.send(DtlsState::Failed);
+                    return Err(e);
+                }
                 ctx.peer_public_key = Some(server_key_exchange.public_key);
+                ctx.server_key_exchange_verified = true;
             }
         }
         Ok(())
@@ -1368,6 +1488,14 @@ impl DtlsInner {
     ) -> Result<()> {
         if ctx.session_keys.is_some() {
             return Ok(());
+        }
+
+        if is_client && !ctx.server_key_exchange_verified {
+            *self.state.lock().unwrap() = DtlsState::Failed;
+            let _ = self.state_tx.send(DtlsState::Failed);
+            return Err(anyhow::anyhow!(
+                "DTLS server identity was not verified before ServerHelloDone"
+            ));
         }
 
         // Send ClientKeyExchange
@@ -1529,7 +1657,7 @@ impl DtlsInner {
         *self.state.lock().unwrap() = DtlsState::Handshaking;
         let _ = self.state_tx.send(DtlsState::Handshaking);
 
-        let mut ctx = HandshakeContext::new();
+        let mut ctx = HandshakeContext::new(self.expected_remote_fingerprint.clone());
 
         // Retransmission state
         let mut retransmit_interval = tokio::time::interval_at(
@@ -1947,6 +2075,7 @@ struct HandshakeContext {
     local_secret: Option<EphemeralSecret>,
     local_public_key_bytes: Vec<u8>,
     peer_public_key: Option<Vec<u8>>,
+    peer_certificate: Option<Vec<u8>>,
     client_random: Option<Vec<u8>>,
     server_random: Option<Vec<u8>>,
     session_keys: Option<SessionKeys>,
@@ -1954,10 +2083,12 @@ struct HandshakeContext {
     handshake_messages: Vec<u8>,
     ems_negotiated: bool,
     srtp_profile: Option<u16>,
+    expected_remote_fingerprint: Option<String>,
+    server_key_exchange_verified: bool,
 }
 
 impl HandshakeContext {
-    fn new() -> Self {
+    fn new(expected_remote_fingerprint: Option<String>) -> Self {
         // Generate ephemeral key for ECDHE
         let local_secret = EphemeralSecret::random(&mut OsRng);
         let local_public = local_secret.public_key();
@@ -1975,6 +2106,7 @@ impl HandshakeContext {
             local_secret: Some(local_secret),
             local_public_key_bytes,
             peer_public_key: None,
+            peer_certificate: None,
             client_random: None,
             server_random: None,
             session_keys: None,
@@ -1982,6 +2114,8 @@ impl HandshakeContext {
             handshake_messages: Vec::new(),
             ems_negotiated: false,
             srtp_profile: None,
+            expected_remote_fingerprint,
+            server_key_exchange_verified: false,
         }
     }
 }
