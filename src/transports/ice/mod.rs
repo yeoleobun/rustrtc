@@ -4,14 +4,16 @@ pub mod stun;
 mod tests;
 pub mod turn;
 
+use crate::config::{BufferDropStrategy, IceServer, IceTransportPolicy, RtcConfiguration};
 use crate::transports::ice::turn::{TurnClient, TurnCredentials};
 use crate::transports::{PacketReceiver, get_local_ip};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -25,12 +27,8 @@ use self::stun::random_u32;
 use self::stun::{
     StunAttribute, StunClass, StunDecoded, StunMessage, StunMethod, random_bytes, random_u64,
 };
-use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 
 pub(crate) const MAX_STUN_MESSAGE: usize = 1500;
-
-#[cfg(any(test, feature = "simulator"))]
-use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(any(test, feature = "simulator"))]
 static PACKET_LOSS_RATE: AtomicU32 = AtomicU32::new(u32::MAX);
 
@@ -63,6 +61,28 @@ pub(crate) fn should_drop_packet() -> bool {
     }
 }
 
+/// Statistics for monitoring buffer behavior
+#[derive(Debug)]
+struct BufferStats {
+    pub packets_received: AtomicU64,
+    pub packets_dropped: AtomicU64,
+    pub current_size: AtomicU32,
+    pub peak_size: AtomicU32,
+    pub last_log_time: std::sync::Mutex<Instant>,
+}
+
+impl Default for BufferStats {
+    fn default() -> Self {
+        Self {
+            packets_received: AtomicU64::new(0),
+            packets_dropped: AtomicU64::new(0),
+            current_size: AtomicU32::new(0),
+            peak_size: AtomicU32::new(0),
+            last_log_time: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum IceCommand {
     StartGathering,
@@ -89,7 +109,11 @@ struct IceTransportInner {
     remote_parameters: std::sync::Mutex<Option<IceParameters>>,
     pending_transactions: std::sync::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
     data_receiver: std::sync::Mutex<Option<Arc<dyn PacketReceiver>>>,
-    buffered_packets: std::sync::Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+    /// Ring buffer for packets when no receiver is registered yet.
+    /// Uses VecDeque for efficient pop_front removal.
+    buffered_packets: std::sync::Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+    /// Statistics for monitoring buffer behavior
+    buffer_stats: Arc<BufferStats>,
     selected_socket: watch::Sender<Option<IceSocketWrapper>>,
     _socket_rx_keeper: watch::Receiver<Option<IceSocketWrapper>>,
     selected_pair_notifier: watch::Sender<Option<IceCandidatePair>>,
@@ -120,7 +144,11 @@ impl std::fmt::Debug for IceTransportInner {
             .field("remote_parameters", &self.remote_parameters)
             .field("pending_transactions", &self.pending_transactions)
             .field("data_receiver", &"PacketReceiver")
-            .field("buffered_packets", &self.buffered_packets)
+            .field(
+                "buffered_packets",
+                &self.buffered_packets.lock().unwrap().len(),
+            )
+            .field("buffer_stats", &self.buffer_stats)
             .field("selected_socket", &self.selected_socket)
             .field("selected_pair_notifier", &self.selected_pair_notifier)
             .field("candidate_tx", &self.candidate_tx)
@@ -546,13 +574,13 @@ impl IceTransport {
             local_candidates: Mutex::new(Vec::new()),
             remote_candidates: std::sync::Mutex::new(Vec::new()),
             gather_state: std::sync::Mutex::new(IceGathererState::New),
-            config,
+            config: config.clone(),
             gatherer,
             local_parameters: std::sync::Mutex::new(IceParameters::generate()),
             remote_parameters: std::sync::Mutex::new(None),
             pending_transactions: std::sync::Mutex::new(HashMap::new()),
             data_receiver: std::sync::Mutex::new(None),
-            buffered_packets: std::sync::Mutex::new(Vec::new()),
+            buffered_packets: std::sync::Mutex::new(VecDeque::new()),
             selected_socket: selected_socket_tx,
             _socket_rx_keeper: selected_socket_rx,
             selected_pair_notifier: selected_pair_tx,
@@ -563,6 +591,7 @@ impl IceTransport {
             checking_pairs: Mutex::new(std::collections::HashSet::new()),
             nomination_complete: nomination_complete_tx,
             _nomination_complete_rx: nomination_complete_rx,
+            buffer_stats: Arc::new(BufferStats::default()),
         };
         let inner = Arc::new(inner);
 
@@ -1221,12 +1250,13 @@ async fn handle_packet(
                 if msg.class == StunClass::Request {
                     if inner.config.transport_mode == crate::TransportMode::Rtp
                         && !inner.config.enable_ice_lite
+                        && !inner.config.enable_latching
                     {
                         warn!(
                             remote_addr = %addr,
                             method = ?msg.method,
                             class = ?msg.class,
-                            "Rejecting STUN on RTP transport without ICE-lite"
+                            "Rejecting STUN on RTP transport without ICE-lite or latching"
                         );
                         return;
                     }
@@ -1271,10 +1301,55 @@ async fn handle_packet(
             rx.receive(Bytes::copy_from_slice(packet), addr).await;
         } else {
             let mut buffer = inner.buffered_packets.lock().unwrap();
-            if buffer.len() < 100 {
-                buffer.push((packet.to_vec(), addr));
+            let stats = inner.buffer_stats.clone();
+            let capacity = inner.config.rtp_buffer_capacity;
+
+            stats.packets_received.fetch_add(1, Ordering::Relaxed);
+
+            if buffer.len() >= capacity {
+                match inner.config.buffer_drop_strategy {
+                    BufferDropStrategy::DropOldest => {
+                        buffer.pop_front();
+                        buffer.push_back((packet.to_vec(), addr));
+                    }
+                    BufferDropStrategy::DropNew => {
+                        debug!("Buffer full, dropping packet from {}", addr);
+                    }
+                }
+                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
             } else {
-                debug!("Buffer full, dropping packet from {}", addr);
+                buffer.push_back((packet.to_vec(), addr));
+            }
+
+            // Update statistics
+            let current_size = buffer.len() as u32;
+            stats.current_size.store(current_size, Ordering::Relaxed);
+
+            // Track peak size
+            let mut peak = stats.peak_size.load(Ordering::Relaxed);
+            while current_size > peak {
+                match stats.peak_size.compare_exchange_weak(
+                    peak,
+                    current_size,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => peak = current,
+                }
+            }
+
+            // Periodic logging
+            let mut last_log = stats.last_log_time.lock().unwrap();
+            if last_log.elapsed() >= inner.config.buffer_stats_log_interval {
+                let received = stats.packets_received.load(Ordering::Relaxed);
+                let dropped = stats.packets_dropped.load(Ordering::Relaxed);
+                let peak_size = stats.peak_size.load(Ordering::Relaxed);
+                debug!(
+                    "Buffer stats: received={}, dropped={}, current={}, peak={}, capacity={}",
+                    received, dropped, current_size, peak_size, capacity
+                );
+                *last_log = Instant::now();
             }
         }
     }
@@ -1346,6 +1421,25 @@ async fn handle_stun_request(
         drop(list);
 
         let _ = inner.cmd_tx.send(IceCommand::RunChecks);
+    }
+    if inner.config.enable_latching {
+        let current_pair = inner.selected_pair.lock().unwrap().clone();
+        if let Some(pair) = current_pair {
+            if pair.remote.address.port() == addr.port() && pair.remote.address.ip() != addr.ip() {
+                debug!(
+                    "RTP latching: updating remote address from {} to {}",
+                    pair.remote.address, addr
+                );
+                let mut new_remote = pair.remote.clone();
+                new_remote.address = addr;
+                let new_pair = IceCandidatePair::new(pair.local.clone(), new_remote);
+                *inner.selected_pair.lock().unwrap() = Some(new_pair.clone());
+                let _ = inner.selected_pair_notifier.send(Some(new_pair.clone()));
+                if let Some(socket) = resolve_socket(&inner, &new_pair) {
+                    let _ = inner.selected_socket.send(Some(socket));
+                }
+            }
+        }
     }
 
     if msg.use_candidate {

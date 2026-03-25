@@ -45,7 +45,6 @@ async fn test_rtp_latching() -> Result<()> {
         return Ok(());
     }
 
-    // Try to find a pair of IPs that can talk to each other
     let mut selected_pair = None;
     for i in 0..ipv4_ips.len() {
         for j in 0..ipv4_ips.len() {
@@ -66,6 +65,16 @@ async fn test_rtp_latching() -> Result<()> {
             if let Ok(Ok((_, src_b))) =
                 tokio::time::timeout(Duration::from_millis(100), socket_a.recv_from(&mut buf)).await
             {
+                if src_b.ip() != ip_b {
+                    println!(
+                        "Skipping IP pair ({}, {}): NAT detected (seen as {})",
+                        ip_a,
+                        ip_b,
+                        src_b.ip()
+                    );
+                    continue;
+                }
+
                 // Verify return path A -> B
                 socket_a.send_to(b"PONG", src_b).await?;
                 if let Ok(Ok(_)) =
@@ -85,7 +94,9 @@ async fn test_rtp_latching() -> Result<()> {
     let (ip1, ip2) = if let Some(pair) = selected_pair {
         pair
     } else {
-        println!("Skipping test_rtp_latching: No two local IPs can reach each other via UDP.");
+        println!(
+            "Skipping test_rtp_latching: No two local IPs can reach each other via UDP without NAT."
+        );
         return Ok(());
     };
 

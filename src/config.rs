@@ -84,6 +84,14 @@ pub enum TransportMode {
     Rtp,
 }
 
+/// Strategy for dropping packets when buffer is full.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum BufferDropStrategy {
+    #[default]
+    DropNew,
+    DropOldest,
+}
+
 /// Tracks user-supplied certificate material.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CertificateConfig {
@@ -256,6 +264,14 @@ impl PartialEq for DepacketizerStrategy {
 
 impl Eq for DepacketizerStrategy {}
 
+fn default_rtp_buffer_capacity() -> usize {
+    100
+}
+
+fn default_buffer_stats_log_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(10)
+}
+
 /// Primary configuration for a `PeerConnection`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RtcConfiguration {
@@ -293,6 +309,12 @@ pub struct RtcConfiguration {
     pub enable_ice_lite: bool,
     #[serde(skip, default)]
     pub depacketizer_strategy: DepacketizerStrategy,
+    #[serde(default = "default_rtp_buffer_capacity")]
+    pub rtp_buffer_capacity: usize,
+    #[serde(default)]
+    pub buffer_drop_strategy: BufferDropStrategy,
+    #[serde(default = "default_buffer_stats_log_interval")]
+    pub buffer_stats_log_interval: std::time::Duration,
 }
 
 impl Default for RtcConfiguration {
@@ -328,6 +350,9 @@ impl Default for RtcConfiguration {
             enable_latching: false,
             enable_ice_lite: false,
             depacketizer_strategy: DepacketizerStrategy::default(),
+            rtp_buffer_capacity: default_rtp_buffer_capacity(),
+            buffer_drop_strategy: BufferDropStrategy::default(),
+            buffer_stats_log_interval: default_buffer_stats_log_interval(),
         }
     }
 }
@@ -491,6 +516,21 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    pub fn rtp_buffer_capacity(mut self, capacity: usize) -> Self {
+        self.inner.rtp_buffer_capacity = capacity;
+        self
+    }
+
+    pub fn buffer_drop_strategy(mut self, strategy: BufferDropStrategy) -> Self {
+        self.inner.buffer_drop_strategy = strategy;
+        self
+    }
+
+    pub fn buffer_stats_log_interval(mut self, interval: std::time::Duration) -> Self {
+        self.inner.buffer_stats_log_interval = interval;
+        self
+    }
+
     pub fn build(self) -> RtcConfiguration {
         self.inner
     }
@@ -519,6 +559,9 @@ mod tests {
         assert_eq!(config.sctp_max_heartbeat_failures, 4);
         assert_eq!(config.sctp_max_burst, 0);
         assert_eq!(config.sctp_max_cwnd, 256 * 1024);
+        assert_eq!(config.rtp_buffer_capacity, 100);
+        assert_eq!(config.buffer_drop_strategy, BufferDropStrategy::DropNew);
+        assert_eq!(config.buffer_stats_log_interval, Duration::from_secs(10));
     }
 
     #[test]
@@ -529,6 +572,18 @@ mod tests {
         assert_eq!(config.stun_timeout, Duration::from_secs(10));
         // Verify other defaults are still there
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_buffer_config_builder() {
+        let config = RtcConfigurationBuilder::new()
+            .rtp_buffer_capacity(200)
+            .buffer_drop_strategy(BufferDropStrategy::DropOldest)
+            .buffer_stats_log_interval(Duration::from_secs(5))
+            .build();
+        assert_eq!(config.rtp_buffer_capacity, 200);
+        assert_eq!(config.buffer_drop_strategy, BufferDropStrategy::DropOldest);
+        assert_eq!(config.buffer_stats_log_interval, Duration::from_secs(5));
     }
 
     #[test]
