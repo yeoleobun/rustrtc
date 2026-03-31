@@ -1252,7 +1252,7 @@ async fn handle_packet(
                         && !inner.config.enable_ice_lite
                         && !inner.config.enable_latching
                     {
-                        warn!(
+                        debug!(
                             remote_addr = %addr,
                             method = ?msg.method,
                             class = ?msg.class,
