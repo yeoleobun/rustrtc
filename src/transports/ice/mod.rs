@@ -11,6 +11,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, VecDeque};
+use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -20,7 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, instrument, trace};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -256,26 +257,38 @@ impl IceTransportRunner {
     async fn run_udp_read_loop(socket: Arc<UdpSocket>, inner: Arc<IceTransportInner>) {
         let mut buf = [0u8; 1500];
         let mut state_rx = inner.state.subscribe();
+        let sender = IceSocketWrapper::Udp(socket.clone());
         trace!("Read loop started for {:?}", socket.local_addr());
         loop {
             tokio::select! {
-                res = socket.recv_from(&mut buf) => {
-                    let (len, addr) = match res {
-                        Ok(v) => v,
-                        Err(e) => {
-                            debug!("Socket recv error: {}", e);
-                            break;
+                res = socket.readable() => {
+                    if let Err(e) = res {
+                        debug!("Socket readable wait error: {}", e);
+                        break;
+                    }
+
+                    loop {
+                        let (len, addr) = match socket.try_recv_from(&mut buf) {
+                            Ok(v) => v,
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                                break;
+                            }
+                            Err(e) => {
+                                debug!("Socket recv error: {}", e);
+                                return;
+                            }
+                        };
+
+                        let packet = &buf[..len];
+                        if len > 0 {
+                            handle_packet(
+                                packet,
+                                addr,
+                                inner.clone(),
+                                sender.clone(),
+                            )
+                            .await;
                         }
-                    };
-                    let packet = &buf[..len];
-                    if len > 0 {
-                        handle_packet(
-                            packet,
-                            addr,
-                            inner.clone(),
-                            IceSocketWrapper::Udp(socket.clone()),
-                        )
-                        .await;
                     }
                 }
                 res = state_rx.changed() => {
@@ -2473,15 +2486,19 @@ impl IceSocketWrapper {
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<usize> {
         loop {
             match self {
-                IceSocketWrapper::Udp(s) => match s.send_to(data, addr).await {
+                IceSocketWrapper::Udp(s) => match s.try_send_to(data, addr) {
                     Ok(len) => return Ok(len),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        s.writable().await?;
+                        continue;
+                    }
                     Err(e) => {
-                        if let Some(code) = e.raw_os_error() {
-                            if code == 55 {
-                                // ENOBUFS on macOS, wait a bit and retry
-                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                                continue;
-                            }
+                        if let Some(code) = e.raw_os_error()
+                            && code == 55
+                        {
+                            // ENOBUFS on macOS, wait for writable and retry.
+                            s.writable().await?;
+                            continue;
                         }
                         let reason = anyhow!("UDP {} -> {} failed: {}", s.local_addr()?, addr, e);
                         return Err(reason);

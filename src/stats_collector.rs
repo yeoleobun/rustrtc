@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 struct RemoteInboundStats {
@@ -14,7 +13,6 @@ struct RemoteInboundStats {
     fraction_lost: u8,
     jitter: u32,
     round_trip_time: Option<f64>,
-    last_updated: SystemTime,
 }
 
 impl Default for RemoteInboundStats {
@@ -24,7 +22,6 @@ impl Default for RemoteInboundStats {
             fraction_lost: 0,
             jitter: 0,
             round_trip_time: None,
-            last_updated: UNIX_EPOCH,
         }
     }
 }
@@ -34,7 +31,6 @@ struct RemoteOutboundStats {
     packets_sent: u32,
     bytes_sent: u32,
     remote_timestamp: u32,
-    last_updated: SystemTime,
 }
 
 impl Default for RemoteOutboundStats {
@@ -43,7 +39,6 @@ impl Default for RemoteOutboundStats {
             packets_sent: 0,
             bytes_sent: 0,
             remote_timestamp: 0,
-            last_updated: UNIX_EPOCH,
         }
     }
 }
@@ -52,7 +47,6 @@ impl Default for RemoteOutboundStats {
 struct LocalInboundStats {
     packets_received: u64,
     bytes_received: u64,
-    last_updated: SystemTime,
 }
 
 impl Default for LocalInboundStats {
@@ -60,7 +54,6 @@ impl Default for LocalInboundStats {
         Self {
             packets_received: 0,
             bytes_received: 0,
-            last_updated: UNIX_EPOCH,
         }
     }
 }
@@ -69,7 +62,6 @@ impl Default for LocalInboundStats {
 struct LocalOutboundStats {
     packets_sent: u64,
     bytes_sent: u64,
-    last_updated: SystemTime,
 }
 
 impl Default for LocalOutboundStats {
@@ -77,7 +69,6 @@ impl Default for LocalOutboundStats {
         Self {
             packets_sent: 0,
             bytes_sent: 0,
-            last_updated: UNIX_EPOCH,
         }
     }
 }
@@ -110,7 +101,6 @@ impl StatsCollector {
             stats.packets_sent = sr.packet_count;
             stats.bytes_sent = sr.octet_count;
             stats.remote_timestamp = sr.ntp_least; // simplified
-            stats.last_updated = SystemTime::now();
         }
 
         // SR also contains report blocks for our streams
@@ -120,7 +110,6 @@ impl StatsCollector {
             stats.packets_lost = block.packets_lost;
             stats.fraction_lost = block.fraction_lost;
             stats.jitter = block.jitter;
-            stats.last_updated = SystemTime::now();
         }
     }
 
@@ -131,7 +120,6 @@ impl StatsCollector {
             stats.packets_lost = block.packets_lost;
             stats.fraction_lost = block.fraction_lost;
             stats.jitter = block.jitter;
-            stats.last_updated = SystemTime::now();
 
             // Calculate RTT if possible
             // delay_since_last_sender_report is in units of 1/65536 seconds
@@ -162,7 +150,6 @@ impl RtpSenderInterceptor for StatsCollector {
         let stats = outbound.entry(packet.header.ssrc).or_default();
         stats.packets_sent += 1;
         stats.bytes_sent += size;
-        stats.last_updated = SystemTime::now();
     }
 }
 
@@ -174,7 +161,6 @@ impl RtpReceiverInterceptor for StatsCollector {
         let stats = inbound.entry(packet.header.ssrc).or_default();
         stats.packets_received += 1;
         stats.bytes_received += size;
-        stats.last_updated = SystemTime::now();
         None
     }
 }

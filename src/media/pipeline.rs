@@ -111,10 +111,15 @@ impl MediaSink for ChannelMediaSink {
                 actual: sample.kind(),
             });
         }
-        self.sender
-            .send(sample)
-            .await
-            .map_err(|_| MediaError::Closed)
+        match self.sender.try_send(sample) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(sample)) => self
+                .sender
+                .send(sample)
+                .await
+                .map_err(|_| MediaError::Closed),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(MediaError::Closed),
+        }
     }
 }
 

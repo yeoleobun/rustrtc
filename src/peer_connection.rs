@@ -4655,11 +4655,9 @@ impl RtpReceiver {
                                             let clock_rate = params.clock_rate;
 
                                             // Fix: Use Depacketizer to handle frames correctly
-                                            if let Ok(samples) = depacketizer.push(packet.clone(), clock_rate, addr, source.kind()) {
-                                                for sample in samples {
-                                                    if let Err(e) = source.send(sample).await {
-                                                         tracing::warn!("Failed to send media sample: {}", e);
-                                                    }
+                                            if let Ok(samples) = depacketizer.push(packet, clock_rate, addr, source.kind()) {
+                                                if let Err(e) = source.send_many(samples).await {
+                                                    tracing::warn!("Failed to send media sample batch: {}", e);
                                                 }
                                             }
 

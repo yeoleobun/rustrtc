@@ -10,14 +10,30 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+async fn try_send_with_fallback<T>(
+    tx: &mpsc::Sender<T>,
+    value: T,
+) -> Result<(), mpsc::error::SendError<T>> {
+    match tx.try_send(value) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(value)) => tx.send(value).await,
+        Err(mpsc::error::TrySendError::Closed(value)) => Err(mpsc::error::SendError(value)),
+    }
+}
+
+#[derive(Default)]
+struct ListenerRegistry {
+    by_ssrc: HashMap<u32, mpsc::Sender<(RtpPacket, SocketAddr)>>,
+    by_rid: HashMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>,
+    by_pt: HashMap<u8, mpsc::Sender<(RtpPacket, SocketAddr)>>,
+    provisional: Option<mpsc::Sender<(RtpPacket, SocketAddr)>>,
+}
+
 pub struct RtpTransport {
     transport: Arc<IceConn>,
     srtp_session: Mutex<Option<Arc<Mutex<SrtpSession>>>>,
-    listeners: Mutex<HashMap<u32, mpsc::Sender<(RtpPacket, SocketAddr)>>>,
+    listeners: Mutex<ListenerRegistry>,
     rtcp_listener: Mutex<Option<mpsc::Sender<Vec<RtcpPacket>>>>,
-    rid_listeners: Mutex<HashMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>>,
-    pt_listeners: Mutex<HashMap<u8, mpsc::Sender<(RtpPacket, SocketAddr)>>>,
-    provisional_listener: Mutex<Option<mpsc::Sender<(RtpPacket, SocketAddr)>>>,
     rid_extension_id: Mutex<Option<u8>>,
     abs_send_time_extension_id: Mutex<Option<u8>>,
     srtp_required: bool,
@@ -36,11 +52,8 @@ impl RtpTransport {
         Self {
             transport,
             srtp_session: Mutex::new(None),
-            listeners: Mutex::new(HashMap::new()),
+            listeners: Mutex::new(ListenerRegistry::default()),
             rtcp_listener: Mutex::new(None),
-            rid_listeners: Mutex::new(HashMap::new()),
-            pt_listeners: Mutex::new(HashMap::new()),
-            provisional_listener: Mutex::new(None),
             rid_extension_id: Mutex::new(None),
             abs_send_time_extension_id: Mutex::new(None),
             srtp_required,
@@ -61,27 +74,27 @@ impl RtpTransport {
 
     pub fn register_listener_sync(&self, ssrc: u32, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock().unwrap();
-        listeners.insert(ssrc, tx);
+        listeners.by_ssrc.insert(ssrc, tx);
     }
 
     pub fn has_listener(&self, ssrc: u32) -> bool {
         let listeners = self.listeners.lock().unwrap();
-        listeners.contains_key(&ssrc)
+        listeners.by_ssrc.contains_key(&ssrc)
     }
 
     pub fn register_rid_listener(&self, rid: String, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
-        let mut listeners = self.rid_listeners.lock().unwrap();
-        listeners.insert(rid, tx);
+        let mut listeners = self.listeners.lock().unwrap();
+        listeners.by_rid.insert(rid, tx);
     }
 
     pub fn register_pt_listener(&self, pt: u8, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
-        let mut listeners = self.pt_listeners.lock().unwrap();
-        listeners.insert(pt, tx);
+        let mut listeners = self.listeners.lock().unwrap();
+        listeners.by_pt.insert(pt, tx);
     }
 
     pub fn register_provisional_listener(&self, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
-        let mut listener = self.provisional_listener.lock().unwrap();
-        *listener = Some(tx);
+        let mut listeners = self.listeners.lock().unwrap();
+        listeners.provisional = Some(tx);
     }
 
     pub fn set_rid_extension_id(&self, id: Option<u8>) {
@@ -178,15 +191,15 @@ impl RtpTransport {
         // Clear SSRC listeners
         {
             let mut listeners = self.listeners.lock().unwrap();
-            count += listeners.len();
-            listeners.clear();
-        }
-
-        // Clear RID listeners
-        {
-            let mut rid_listeners = self.rid_listeners.lock().unwrap();
-            count += rid_listeners.len();
-            rid_listeners.clear();
+            count += listeners.by_ssrc.len();
+            listeners.by_ssrc.clear();
+            count += listeners.by_rid.len();
+            listeners.by_rid.clear();
+            count += listeners.by_pt.len();
+            listeners.by_pt.clear();
+            if listeners.provisional.take().is_some() {
+                count += 1;
+            }
         }
 
         // Clear RTCP listener
@@ -260,7 +273,7 @@ impl PacketReceiver for RtpTransport {
             if let Some(tx) = listener {
                 match parse_rtcp_packets(&unprotected) {
                     Ok(packets) => {
-                        if tx.send(packets).await.is_err() {
+                        if try_send_with_fallback(&tx, packets).await.is_err() {
                             let mut guard = self.rtcp_listener.lock().unwrap();
                             *guard = None;
                         }
@@ -277,44 +290,45 @@ impl PacketReceiver for RtpTransport {
                     //    println!("RTP Extension Profile: {:x}", ext.profile);
                     // }
                     let ssrc = rtp_packet.header.ssrc;
-                    let mut listener = None;
-
-                    // Try RID first
-                    let rid_id = *self.rid_extension_id.lock().unwrap();
-                    if let Some(id) = rid_id {
-                        if let Some(rid) = rtp_packet.header.get_extension(id) {
-                            // Parse RID string
-                            let rid_str = String::from_utf8_lossy(&rid).to_string();
-                            let rid_listeners = self.rid_listeners.lock().unwrap();
-                            listener = rid_listeners.get(&rid_str).cloned();
-                        }
-                    }
-
-                    // Fallback to SSRC listener
-                    if listener.is_none() {
-                        let listeners = self.listeners.lock().unwrap();
-                        listener = listeners.get(&ssrc).cloned();
-                    }
-
                     let pt = rtp_packet.header.payload_type;
-                    if listener.is_none() {
-                        let pt_listeners = self.pt_listeners.lock().unwrap();
-                        if let Some(pt_tx) = pt_listeners.get(&pt) {
-                            listener = Some(pt_tx.clone());
-                        }
-                    }
 
-                    if listener.is_none() {
-                        let provisional = self.provisional_listener.lock().unwrap();
-                        if let Some(tx) = provisional.as_ref() {
-                            listener = Some(tx.clone());
+                    let listener = {
+                        let rid_id = *self.rid_extension_id.lock().unwrap();
+                        let listeners = self.listeners.lock().unwrap();
+                        let mut selected = None;
+
+                        // Try RID first
+                        if let Some(id) = rid_id {
+                            if let Some(rid) = rtp_packet.header.get_extension(id) {
+                                if let Ok(rid_str) = std::str::from_utf8(&rid) {
+                                    selected = listeners.by_rid.get(rid_str).cloned();
+                                }
+                            }
                         }
-                    }
+
+                        // Fallback to SSRC listener
+                        if selected.is_none() {
+                            selected = listeners.by_ssrc.get(&ssrc).cloned();
+                        }
+
+                        if selected.is_none() {
+                            selected = listeners.by_pt.get(&pt).cloned();
+                        }
+
+                        if selected.is_none() {
+                            selected = listeners.provisional.clone();
+                        }
+
+                        selected
+                    };
 
                     if let Some(tx) = listener {
-                        if tx.send((rtp_packet, addr)).await.is_err() {
+                        if try_send_with_fallback(&tx, (rtp_packet, addr))
+                            .await
+                            .is_err()
+                        {
                             let mut listeners = self.listeners.lock().unwrap();
-                            listeners.remove(&ssrc);
+                            listeners.by_ssrc.remove(&ssrc);
                         }
                     } else {
                         tracing::debug!(

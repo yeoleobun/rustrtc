@@ -7,6 +7,19 @@ pub mod sctp;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const DEFAULT_LOCAL_IP_CACHE_TTL: Duration = Duration::from_secs(5);
+const LOCAL_IP_CACHE_TTL_ENV: &str = "RUSTRTC_LOCAL_IP_CACHE_TTL_SECS";
+
+#[derive(Clone, Copy)]
+struct LocalIpCacheEntry {
+    ip: IpAddr,
+    expires_at: Instant,
+}
+
+static LOCAL_IP_CACHE: OnceLock<Mutex<Option<LocalIpCacheEntry>>> = OnceLock::new();
 
 #[async_trait]
 pub trait PacketReceiver: Send + Sync {
@@ -14,6 +27,60 @@ pub trait PacketReceiver: Send + Sync {
 }
 
 pub fn get_local_ip() -> Result<IpAddr, anyhow::Error> {
+    let ttl = local_ip_cache_ttl();
+    if ttl.is_zero() {
+        return resolve_local_ip_uncached();
+    }
+
+    let cache = LOCAL_IP_CACHE.get_or_init(|| Mutex::new(None));
+
+    {
+        let cache_guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = *cache_guard
+            && Instant::now() < entry.expires_at
+        {
+            return Ok(entry.ip);
+        }
+    }
+
+    let ip = resolve_local_ip_uncached()?;
+
+    {
+        let mut cache_guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cache_guard = Some(LocalIpCacheEntry {
+            ip,
+            expires_at: Instant::now() + ttl,
+        });
+    }
+
+    Ok(ip)
+}
+
+fn local_ip_cache_ttl() -> Duration {
+    static TTL: OnceLock<Duration> = OnceLock::new();
+
+    *TTL.get_or_init(|| match std::env::var(LOCAL_IP_CACHE_TTL_ENV) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs),
+            Err(_) => {
+                tracing::warn!(
+                    "Invalid {} value '{}', fallback to {}s",
+                    LOCAL_IP_CACHE_TTL_ENV,
+                    value,
+                    DEFAULT_LOCAL_IP_CACHE_TTL.as_secs()
+                );
+                DEFAULT_LOCAL_IP_CACHE_TTL
+            }
+        },
+        Err(_) => DEFAULT_LOCAL_IP_CACHE_TTL,
+    })
+}
+
+fn resolve_local_ip_uncached() -> Result<IpAddr, anyhow::Error> {
     use local_ip_address::list_afinet_netifas;
     if let Ok(interfaces) = list_afinet_netifas() {
         // Score function to prioritize interfaces

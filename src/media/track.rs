@@ -10,6 +10,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use tokio::sync::broadcast::error::TryRecvError as BroadcastTryRecvError;
+use tokio::sync::mpsc::error::TryRecvError as MpscTryRecvError;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{debug, warn};
 
@@ -141,10 +143,42 @@ impl SampleStreamSource {
                 actual: sample.kind(),
             });
         }
-        self.sender
-            .send(sample)
-            .await
-            .map_err(|_| MediaError::Closed)
+        match self.sender.try_send(sample) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(sample)) => self
+                .sender
+                .send(sample)
+                .await
+                .map_err(|_| MediaError::Closed),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(MediaError::Closed),
+        }
+    }
+
+    pub async fn send_many<I>(&self, samples: I) -> MediaResult<()>
+    where
+        I: IntoIterator<Item = MediaSample>,
+    {
+        for sample in samples {
+            if sample.kind() != self.kind {
+                return Err(MediaError::KindMismatch {
+                    expected: self.kind,
+                    actual: sample.kind(),
+                });
+            }
+
+            match self.sender.try_send(sample) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(sample)) => {
+                    self.sender
+                        .send(sample)
+                        .await
+                        .map_err(|_| MediaError::Closed)?;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(MediaError::Closed),
+            }
+        }
+
+        Ok(())
     }
 
     pub fn try_send_audio(&self, frame: AudioFrame) -> MediaResult<()> {
@@ -343,6 +377,16 @@ impl MediaStreamTrack for SampleStreamTrack {
 
     async fn recv(&self) -> MediaResult<MediaSample> {
         let mut rx = self.receiver.lock().await;
+
+        match rx.try_recv() {
+            Ok(sample) => return Ok(sample),
+            Err(MpscTryRecvError::Empty) => {}
+            Err(MpscTryRecvError::Disconnected) => {
+                self.ended.store(true, Ordering::SeqCst);
+                return Err(MediaError::EndOfStream);
+            }
+        }
+
         match rx.recv().await {
             Some(sample) => Ok(sample),
             None => {
@@ -383,6 +427,21 @@ impl MediaStreamTrack for RelayStreamTrack {
             return Err(MediaError::EndOfStream);
         }
         let mut rx = self.receiver.lock().await;
+
+        match rx.try_recv() {
+            Ok(RelayEvent::Sample(sample)) => return Ok(sample),
+            Ok(RelayEvent::End) => {
+                self.ended.store(true, Ordering::SeqCst);
+                return Err(MediaError::EndOfStream);
+            }
+            Err(BroadcastTryRecvError::Empty) => {}
+            Err(BroadcastTryRecvError::Lagged(_)) => return Err(MediaError::Lagged),
+            Err(BroadcastTryRecvError::Closed) => {
+                self.ended.store(true, Ordering::SeqCst);
+                return Err(MediaError::EndOfStream);
+            }
+        }
+
         match rx.recv().await {
             Ok(RelayEvent::Sample(sample)) => Ok(sample),
             Ok(RelayEvent::End) => {
