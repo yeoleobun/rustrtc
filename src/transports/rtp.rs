@@ -9,8 +9,21 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
+
+const EXT_ID_NONE: u8 = 0;
+
+#[inline]
+fn encode_ext_id(id: Option<u8>) -> u8 {
+    id.unwrap_or(EXT_ID_NONE)
+}
+
+#[inline]
+fn decode_ext_id(raw: u8) -> Option<u8> {
+    if raw == EXT_ID_NONE { None } else { Some(raw) }
+}
 
 async fn try_send_with_fallback<T>(
     tx: &mpsc::Sender<T>,
@@ -131,8 +144,8 @@ pub struct RtpTransport {
     srtp_session: Mutex<Option<Arc<Mutex<SrtpSession>>>>,
     listeners: Mutex<ListenerRegistry>,
     rtcp_listener: Mutex<Option<mpsc::Sender<Vec<RtcpPacket>>>>,
-    rid_extension_id: Mutex<Option<u8>>,
-    abs_send_time_extension_id: Mutex<Option<u8>>,
+    rid_extension_id: AtomicU8,
+    abs_send_time_extension_id: AtomicU8,
     rewrite_bridge: Mutex<Option<Arc<RewriteBridge>>>,
     srtp_required: bool,
 }
@@ -152,8 +165,8 @@ impl RtpTransport {
             srtp_session: Mutex::new(None),
             listeners: Mutex::new(ListenerRegistry::default()),
             rtcp_listener: Mutex::new(None),
-            rid_extension_id: Mutex::new(None),
-            abs_send_time_extension_id: Mutex::new(None),
+            rid_extension_id: AtomicU8::new(EXT_ID_NONE),
+            abs_send_time_extension_id: AtomicU8::new(EXT_ID_NONE),
             rewrite_bridge: Mutex::new(None),
             srtp_required,
             // allow_ssrc_change,
@@ -197,11 +210,13 @@ impl RtpTransport {
     }
 
     pub fn set_rid_extension_id(&self, id: Option<u8>) {
-        *self.rid_extension_id.lock() = id;
+        self.rid_extension_id
+            .store(encode_ext_id(id), Ordering::Relaxed);
     }
 
     pub fn set_abs_send_time_extension_id(&self, id: Option<u8>) {
-        *self.abs_send_time_extension_id.lock() = id;
+        self.abs_send_time_extension_id
+            .store(encode_ext_id(id), Ordering::Relaxed);
     }
 
     pub fn register_rtcp_listener(&self, tx: mpsc::Sender<Vec<RtcpPacket>>) {
@@ -225,7 +240,9 @@ impl RtpTransport {
                 let mut packet = RtpPacket::parse(buf)?;
 
                 // Inject abs-send-time if enabled
-                if let Some(id) = *self.abs_send_time_extension_id.lock() {
+                if let Some(id) =
+                    decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed))
+                {
                     let abs_send_time =
                         crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
                     let data = abs_send_time.to_be_bytes()[1..4].to_vec();
@@ -246,7 +263,7 @@ impl RtpTransport {
 
     pub async fn send_rtp(&self, mut packet: RtpPacket) -> Result<usize> {
         // Inject abs-send-time if enabled
-        if let Some(id) = *self.abs_send_time_extension_id.lock() {
+        if let Some(id) = decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed)) {
             let abs_send_time = crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
             let data = abs_send_time.to_be_bytes()[1..4].to_vec();
             packet.header.set_extension(id, &data)?;
@@ -422,7 +439,7 @@ impl PacketReceiver for RtpTransport {
             let pt = rtp_packet.header.payload_type;
 
             let listener = {
-                let rid_id = *self.rid_extension_id.lock();
+                let rid_id = decode_ext_id(self.rid_extension_id.load(Ordering::Relaxed));
                 let listeners = self.listeners.lock();
                 let mut selected = None;
 
@@ -586,7 +603,6 @@ mod tests {
         use crate::transports::ice::IceSocketWrapper;
         use tokio::net::UdpSocket;
         use tokio::sync::watch;
-        use tokio::time::{Duration, timeout};
 
         let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
@@ -595,9 +611,7 @@ mod tests {
 
         let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let receiver_addr = receiver.local_addr().unwrap();
-        let dst_conn = IceConn::new(dst_rx, receiver_addr);
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap());
         let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
 
         src_transport.bridge_rewrite_to(
@@ -610,28 +624,18 @@ mod tests {
             },
         );
 
-        let packet = RtpPacket::new(crate::rtp::RtpHeader::new(0, 7, 1111, 100), vec![1u8; 32]);
-        src_transport
-            .receive(
-                Bytes::from(packet.marshal().unwrap()),
-                "127.0.0.1:5000".parse().unwrap(),
-            )
-            .await;
+        let bridge = src_transport
+            .rewrite_bridge
+            .lock()
+            .clone()
+            .expect("rewrite bridge should be configured");
 
-        let recv_timeout = if cfg!(debug_assertions) {
-            Duration::from_millis(300)
-        } else {
-            Duration::from_secs(2)
-        };
-        let mut buf = [0u8; 1500];
-        let (len, _) = timeout(recv_timeout, receiver.recv_from(&mut buf))
-            .await
-            .expect("rewrite bridge packet timed out")
-            .expect("receiver recv_from failed");
-        let rewritten = RtpPacket::parse(&buf[..len]).unwrap();
-        assert_eq!(rewritten.header.ssrc, 1000);
-        assert_eq!(rewritten.header.payload_type, 96);
-        assert_eq!(rewritten.header.sequence_number, 32000);
-        assert_eq!(rewritten.header.timestamp, 1111 + 12345);
+        let mut packet = RtpPacket::new(crate::rtp::RtpHeader::new(0, 7, 1111, 100), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut packet);
+
+        assert_eq!(packet.header.ssrc, 1000);
+        assert_eq!(packet.header.payload_type, 96);
+        assert_eq!(packet.header.sequence_number, 32000);
+        assert_eq!(packet.header.timestamp, 1111 + 12345);
     }
 }

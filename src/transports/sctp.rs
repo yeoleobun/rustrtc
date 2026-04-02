@@ -882,6 +882,7 @@ impl SctpInner {
             }
 
             let now = Instant::now();
+            let rto_snapshot = self.rto_state.lock().rto;
 
             // 1. Calculate RTO Timeout
             let rto_timeout_cached = {
@@ -902,7 +903,7 @@ impl SctpInner {
             } else {
                 let t = {
                     let sent_queue = self.sent_queue.lock();
-                    let rto = self.rto_state.lock().rto;
+                    let rto = rto_snapshot;
                     let mut soonest_expiry = None;
                     let mut soonest_tsn = None;
 
@@ -956,8 +957,7 @@ impl SctpInner {
             let t1_timeout = if self.t1_active.load(Ordering::Relaxed) {
                 let t1_sent = self.t1_sent_time.lock();
                 if let Some(sent) = *t1_sent {
-                    let rto = self.rto_state.lock().rto;
-                    let expiry = sent + Duration::from_secs_f64(rto);
+                    let expiry = sent + Duration::from_secs_f64(rto_snapshot);
                     if expiry > now {
                         expiry - now
                     } else {
