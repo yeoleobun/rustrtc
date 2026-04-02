@@ -232,7 +232,7 @@ impl SrtpContext {
 
         let rtp_auth_prototype = if !rtp_keys.auth_key.is_empty() {
             Some(
-                <HmacSha1 as Mac>::new_from_slice(&rtp_keys.auth_key)
+                <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&rtp_keys.auth_key)
                     .map_err(|_| SrtpError::UnsupportedProfile)?,
             )
         } else {
@@ -497,7 +497,7 @@ impl SrtpContext {
     }
 
     fn auth_tag_rtcp(&self, data: &[u8]) -> SrtpResult<Vec<u8>> {
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.rtcp_keys.auth_key)
+        let mut mac = <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&self.rtcp_keys.auth_key)
             .map_err(|_| SrtpError::UnsupportedProfile)?;
         mac.update(data);
         let result = mac.finalize().into_bytes();

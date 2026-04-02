@@ -21,11 +21,11 @@ use p256::{
     ecdh::EphemeralSecret,
     elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
 };
+use parking_lot::Mutex;
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
@@ -1874,7 +1874,7 @@ fn prf_sha256(secret: &[u8], label: &[u8], seed: &[u8], output_length: usize) ->
     real_seed.extend_from_slice(seed);
 
     let mut a = real_seed.clone();
-    let mac_prototype = <Hmac<Sha256> as Mac>::new_from_slice(secret)
+    let mac_prototype = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(secret)
         .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
 
     while output.len() < output_length {

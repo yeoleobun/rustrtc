@@ -5,11 +5,11 @@ use crate::transports::ice::stun::random_u32;
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use hmac::{Hmac, Mac};
+use parking_lot::Mutex;
 use sha1::Sha1;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, trace};
@@ -1123,8 +1123,8 @@ impl SctpInner {
             .unwrap_or_default()
             .as_millis() as u64;
         let timestamp = now_ms.to_be_bytes();
-        let mut mac =
-            HmacSha1::new_from_slice(&self.cookie_hmac_key).expect("HMAC key length is valid");
+        let mut mac = <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&self.cookie_hmac_key)
+            .expect("HMAC key length is valid");
         mac.update(&timestamp);
         let result = mac.finalize();
         let mut cookie = Vec::with_capacity(COOKIE_TOTAL_LEN);
@@ -1140,8 +1140,8 @@ impl SctpInner {
         }
         let timestamp = &cookie[..COOKIE_TIMESTAMP_LEN];
         let received_mac = &cookie[COOKIE_TIMESTAMP_LEN..];
-        let mut mac =
-            HmacSha1::new_from_slice(&self.cookie_hmac_key).expect("HMAC key length is valid");
+        let mut mac = <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&self.cookie_hmac_key)
+            .expect("HMAC key length is valid");
         mac.update(timestamp);
         if mac.verify_slice(received_mac).is_err() {
             return false;
@@ -5944,7 +5944,7 @@ mod tests {
 
     #[test]
     fn test_cookie_hmac_generation() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha1::Sha1;
         type TestHmac = Hmac<Sha1>;
 
@@ -5972,7 +5972,7 @@ mod tests {
 
     #[test]
     fn test_cookie_format_and_validation_logic() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha1::Sha1;
         type TestHmac = Hmac<Sha1>;
 
@@ -8145,8 +8145,7 @@ mod tests {
         }
 
         // Set heartbeat_sent_time so the failure path is triggered
-        *sctp.inner.heartbeat_sent_time.lock() =
-            Some(Instant::now() - Duration::from_secs(30));
+        *sctp.inner.heartbeat_sent_time.lock() = Some(Instant::now() - Duration::from_secs(30));
 
         // With default config (max_heartbeat_failures=4), the connection would close after 4 failures.
         // With our config (max_heartbeat_failures=8), it should survive through 7 failures.
@@ -8168,8 +8167,7 @@ mod tests {
                 i, failures, state
             );
             // Re-set heartbeat_sent_time for next iteration
-            *sctp.inner.heartbeat_sent_time.lock() =
-                Some(Instant::now() - Duration::from_secs(30));
+            *sctp.inner.heartbeat_sent_time.lock() = Some(Instant::now() - Duration::from_secs(30));
         }
 
         // The 8th failure should close the connection
@@ -8739,18 +8737,15 @@ mod tests {
 
         // Add chunks to outbound queue - each ~116 bytes wire size
         for i in 0..20 {
-            sctp.inner
-                .outbound_queue
-                .lock()
-                .push_back(OutboundChunk {
-                    stream_id: 0,
-                    ppid: 53,
-                    payload: Bytes::from(vec![i as u8; 100]),
-                    flags: 0x03,
-                    ssn: i,
-                    max_retransmits: None,
-                    expiry: None,
-                });
+            sctp.inner.outbound_queue.lock().push_back(OutboundChunk {
+                stream_id: 0,
+                ppid: 53,
+                payload: Bytes::from(vec![i as u8; 100]),
+                flags: 0x03,
+                ssn: i,
+                max_retransmits: None,
+                expiry: None,
+            });
         }
 
         // Set a small effective window (cwnd=500, flight=0, rwnd=large)

@@ -586,6 +586,7 @@ mod tests {
         use crate::transports::ice::IceSocketWrapper;
         use tokio::net::UdpSocket;
         use tokio::sync::watch;
+        use tokio::time::{Duration, timeout};
 
         let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
@@ -617,8 +618,16 @@ mod tests {
             )
             .await;
 
+        let recv_timeout = if cfg!(debug_assertions) {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_secs(2)
+        };
         let mut buf = [0u8; 1500];
-        let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+        let (len, _) = timeout(recv_timeout, receiver.recv_from(&mut buf))
+            .await
+            .expect("rewrite bridge packet timed out")
+            .expect("receiver recv_from failed");
         let rewritten = RtpPacket::parse(&buf[..len]).unwrap();
         assert_eq!(rewritten.header.ssrc, 1000);
         assert_eq!(rewritten.header.payload_type, 96);

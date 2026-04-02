@@ -431,7 +431,7 @@ fn parse_xor_address(value: &[u8], transaction_id: &[u8; 12]) -> Result<Option<S
 }
 
 fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
-    let mut mac = HmacSha1::new_from_slice(key).expect("HMAC key init");
+    let mut mac = <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(key).expect("HMAC key init");
     mac.update(data);
     let result = mac.finalize().into_bytes();
     let mut output = [0u8; 20];
