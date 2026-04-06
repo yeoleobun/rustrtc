@@ -31,7 +31,7 @@ const DUP_THRESH: u8 = 3;
 // Use IW10 (RFC 6928) for faster ramp-up, matching modern TCP behaviour
 const CWND_INITIAL: usize = MAX_SCTP_PACKET_SIZE * 10; // 10 * 1200 = 12000 bytes
 const SSTHRESH_MIN: usize = MAX_SCTP_PACKET_SIZE * 4; // 4 * 1200 = 4800 bytes
-const CWND_MIN_AFTER_RTO: usize = MAX_SCTP_PACKET_SIZE; // 1 * 1200 = 1200 bytes
+const CWND_MIN_AFTER_RTO: usize = MAX_SCTP_PACKET_SIZE * 4; // 4 * 1200 = 4800 bytes (faster recovery after RTO)
 const MAX_BUFFERED_AMOUNT: usize = 256 * 1024; // 256KB - reduced for lower memory footprint
 
 // Memory limits for inbound queues - balanced for memory efficiency and loss tolerance
@@ -42,7 +42,7 @@ const MAX_RECEIVED_QUEUE_SIZE: usize = 512; // max out-of-order packets (increas
 
 // Fast Recovery re-entry cooldown: prevent rapid exit-then-re-enter cycles that
 // keep cwnd pinned at SSTHRESH_MIN on lossy links (e.g. rate-limited TURN relays).
-const FAST_RECOVERY_REENTRY_COOLDOWN: Duration = Duration::from_millis(200);
+const FAST_RECOVERY_REENTRY_COOLDOWN: Duration = Duration::from_millis(500);
 
 const SCTP_MAX_INIT_RETRANS: u32 = 8;
 const COOKIE_HMAC_LEN: usize = 20; // SHA1 output
@@ -8401,7 +8401,7 @@ mod tests {
 
         // Verify cooldown constant exists and has correct value
         let _cooldown_ms = FAST_RECOVERY_REENTRY_COOLDOWN.as_millis();
-        assert_eq!(_cooldown_ms, 200, "Fast recovery cooldown should be 200ms");
+        assert_eq!(_cooldown_ms, 500, "Fast recovery cooldown should be 500ms");
 
         // Verify that last_fast_recovery_entry is tracked
         let entry_time = *sctp.inner.last_fast_recovery_entry.lock();

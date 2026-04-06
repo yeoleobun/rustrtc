@@ -2275,25 +2275,25 @@ impl IceGatherer {
             }
         };
 
-        // UPnP depends on host sockets, so run after host_fut
-        let upnp_fut = async {
-            if self.config.enable_upnp && self.config.ice_transport_policy == IceTransportPolicy::All
-            {
-                if let Err(e) = self.gather_upnp_candidates().await {
-                    debug!("UPnP gathering failed: {}", e);
-                }
-            }
-        };
+        host_fut.await;
 
-        let server_fut = async {
+        // STUN must complete before UPnP so we can detect double-NAT
+        // and use STUN's public IP for UPnP candidates
+        let stun_public_ip = if self.config.enable_upnp {
+            self.gather_servers_and_get_public_ip().await
+        } else {
             if let Err(e) = self.gather_servers().await {
                 debug!("Server gathering failed: {}", e);
             }
+            None
         };
 
-        // Run host first, then UPnP and servers in parallel
-        host_fut.await;
-        tokio::join!(upnp_fut, server_fut);
+        // UPnP depends on host sockets and optionally STUN's public IP
+        if self.config.enable_upnp && self.config.ice_transport_policy == IceTransportPolicy::All {
+            if let Err(e) = self.gather_upnp_candidates(stun_public_ip).await {
+                debug!("UPnP gathering failed: {}", e);
+            }
+        }
 
         *self.state.lock() = IceGathererState::Complete;
         Ok(())
@@ -2387,7 +2387,7 @@ impl IceGatherer {
         Ok(())
     }
 
-    async fn gather_upnp_candidates(&self) -> Result<()> {
+    async fn gather_upnp_candidates(&self, stun_public_ip: Option<IpAddr>) -> Result<()> {
         let sockets = self.sockets.lock().clone();
 
         for socket in sockets {
@@ -2422,9 +2422,35 @@ impl IceGatherer {
             // Try to add port mapping (0 = use same port as local)
             match mapper.add_mapping(0).await {
                 Ok(external_addr) => {
+                    // Check if UPnP returned a private IP (double-NAT scenario)
+                    let is_private = is_private_ip(&external_addr.ip());
+
+                    // Final address for the candidate
+                    let candidate_addr = if is_private {
+                        if let Some(public_ip) = stun_public_ip {
+                            // Double-NAT: use STUN's public IP with UPnP's port
+                            let mut addr = external_addr;
+                            addr.set_ip(public_ip);
+                            debug!(
+                                "UPnP double-NAT detected: {} is private, using STUN public IP {} -> {}",
+                                external_addr.ip(), public_ip, addr
+                            );
+                            addr
+                        } else {
+                            // No STUN public IP available, use as-is (may not work)
+                            debug!(
+                                "UPnP returned private IP {} but no STUN public IP available",
+                                external_addr
+                            );
+                            external_addr
+                        }
+                    } else {
+                        external_addr
+                    };
+
                     // Create server reflexive candidate for the mapping
                     let candidate =
-                        IceCandidate::server_reflexive(local_addr, external_addr, 1);
+                        IceCandidate::server_reflexive(local_addr, candidate_addr, 1);
                     self.push_candidate(candidate);
 
                     // Store mapper for later cleanup
@@ -2432,7 +2458,7 @@ impl IceGatherer {
 
                     debug!(
                         "UPnP candidate gathered: {} -> {}",
-                        local_addr, external_addr
+                        local_addr, candidate_addr
                     );
                 }
                 Err(e) => {
@@ -2484,6 +2510,61 @@ impl IceGatherer {
 
         while let Some(_) = tasks.next().await {}
         Ok(())
+    }
+
+    /// Gather server candidates and return the first public IP discovered via STUN.
+    /// This is used to detect and fix double-NAT scenarios for UPnP.
+    async fn gather_servers_and_get_public_ip(&self) -> Option<IpAddr> {
+        let mut tasks = FuturesUnordered::new();
+        let public_ip: Arc<parking_lot::Mutex<Option<IpAddr>>> = Arc::new(parking_lot::Mutex::new(None));
+
+        for server in &self.config.ice_servers {
+            for url in &server.urls {
+                let server = server.clone();
+                let url = url.clone();
+                let this = self.clone();
+                let public_ip_clone = public_ip.clone();
+
+                tasks.push(async move {
+                    let uri = match IceServerUri::parse(&url) {
+                        Ok(uri) => uri,
+                        Err(err) => {
+                            debug!("invalid ICE server URI {}: {}", url, err);
+                            return;
+                        }
+                    };
+
+                    match uri.kind {
+                        IceUriKind::Stun => {
+                            if this.config.ice_transport_policy == IceTransportPolicy::All {
+                                match this.probe_stun(&uri).await {
+                                    Ok(Some(candidate)) => {
+                                        // Capture public IP if it's not private
+                                        if !is_private_ip(&candidate.address.ip()) {
+                                            let mut ip = public_ip_clone.lock();
+                                            if ip.is_none() {
+                                                *ip = Some(candidate.address.ip());
+                                            }
+                                        }
+                                        this.push_candidate(candidate);
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => debug!("STUN probe failed for {}: {}", url, e),
+                                }
+                            }
+                        }
+                        IceUriKind::Turn => match this.probe_turn(&uri, &server).await {
+                            Ok(Some(candidate)) => this.push_candidate(candidate),
+                            Ok(None) => {}
+                            Err(e) => debug!("TURN probe failed for {}: {}", url, e),
+                        },
+                    }
+                });
+            }
+        }
+
+        while let Some(_) = tasks.next().await {}
+        public_ip.lock().clone()
     }
 
     async fn probe_stun(&self, uri: &IceServerUri) -> Result<Option<IceCandidate>> {
@@ -2668,6 +2749,33 @@ fn default_transport_for_scheme(scheme: &str) -> Result<IceTransportProtocol> {
         "stuns" | "turns" => IceTransportProtocol::Tcp,
         other => bail!("unsupported scheme {}", other),
     })
+}
+
+/// Check if an IP address is a private/internal address (not publicly routable)
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            // 10.0.0.0/8
+            octets[0] == 10
+                // 172.16.0.0/12
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                // 192.168.0.0/16
+                || (octets[0] == 192 && octets[1] == 168)
+                // 169.254.0.0/16 (link-local)
+                || (octets[0] == 169 && octets[1] == 254)
+                // 127.0.0.0/8 (loopback)
+                || octets[0] == 127
+        }
+        IpAddr::V6(ipv6) => {
+            // IPv6 unique local fc00::/7
+            ipv6.segments()[0] & 0xfe00 == 0xfc00
+                // IPv6 link-local fe80::/10
+                || ipv6.segments()[0] & 0xffc0 == 0xfe80
+                // IPv6 loopback ::1
+                || *ipv6 == std::net::Ipv6Addr::LOCALHOST
+        }
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
