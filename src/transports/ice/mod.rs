@@ -2564,19 +2564,35 @@ impl IceGatherer {
         }
 
         while let Some(_) = tasks.next().await {}
-        public_ip.lock().clone()
+        let ip = public_ip.lock().clone();
+        if let Some(ip) = &ip {
+            debug!("STUN public IP for UPnP double-NAT detection: {}", ip);
+        } else {
+            debug!("No STUN public IP available for UPnP double-NAT detection");
+        }
+        ip
     }
 
     async fn probe_stun(&self, uri: &IceServerUri) -> Result<Option<IceCandidate>> {
         let addr = uri.resolve(self.config.disable_ipv6).await?;
+
+        // Find a suitable host address to bind to (prefer non-loopback IPv4)
+        let bind_ip = self.local_candidates.lock()
+            .iter()
+            .filter(|c| c.typ == IceCandidateType::Host)
+            .filter_map(|c| match c.address.ip() {
+                IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(IpAddr::V4(ip)),
+                _ => None,
+            })
+            .next()
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+
         let socket = match uri.transport {
             IceTransportProtocol::Udp => {
-                self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
-                    .await?
+                self.bind_socket(bind_ip).await?
             }
             IceTransportProtocol::Tcp => {
-                self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
-                    .await?
+                self.bind_socket(bind_ip).await?
             }
         };
         let local_addr = socket.local_addr()?;

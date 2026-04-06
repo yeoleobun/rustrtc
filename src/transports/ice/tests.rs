@@ -65,6 +65,57 @@ async fn stun_probe_yields_server_reflexive_candidate() -> Result<()> {
 }
 
 #[tokio::test]
+async fn stun_candidate_raddr_is_not_unspecified() -> Result<()> {
+    // Verify that STUN candidate's related address (raddr) is not 0.0.0.0
+    // Per RFC 5245, raddr should be the base (host) address
+    let mut turn_server = TestTurnServer::start().await?;
+    let mut config = RtcConfiguration::default();
+    config
+        .ice_servers
+        .push(IceServer::new(vec![turn_server.stun_url()]));
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
+    gatherer.gather().await?;
+    let candidates = gatherer.local_candidates();
+
+    // Find the srflx candidate
+    let srflx = candidates
+        .iter()
+        .find(|c| matches!(c.typ, IceCandidateType::ServerReflexive));
+
+    if let Some(candidate) = srflx {
+        // Check that related_address exists and is not unspecified (0.0.0.0 or ::)
+        if let Some(raddr) = candidate.related_address {
+            assert!(
+                !raddr.ip().is_unspecified(),
+                "STUN candidate raddr should not be unspecified (0.0.0.0), got: {}",
+                raddr.ip()
+            );
+
+            // Also verify raddr matches one of the host candidates
+            let host_addresses: Vec<_> = candidates
+                .iter()
+                .filter(|c| matches!(c.typ, IceCandidateType::Host))
+                .map(|c| c.address.ip())
+                .collect();
+
+            assert!(
+                host_addresses.contains(&raddr.ip()),
+                "STUN candidate raddr ({}) should match a host candidate address. Host addresses: {:?}",
+                raddr.ip(),
+                host_addresses
+            );
+        } else {
+            panic!("STUN candidate should have a related_address");
+        }
+    }
+
+    turn_server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
 #[serial]
 async fn turn_probe_yields_relay_candidate() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
