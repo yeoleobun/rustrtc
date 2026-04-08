@@ -56,6 +56,7 @@ async fn handle_offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
         codec_name: "VP8".to_string(),
         clock_rate: 90000,
         rtcp_fbs: vec!["nack".to_string(), "pli".to_string()],
+        ..Default::default()
     }];
     config.media_capabilities = Some(caps);
 
@@ -125,6 +126,7 @@ async fn run_client(addr_str: &str) {
         codec_name: "VP8".to_string(),
         clock_rate: 90000,
         rtcp_fbs: vec!["nack".to_string(), "pli".to_string()],
+        ..Default::default()
     }];
     config.media_capabilities = Some(caps);
 

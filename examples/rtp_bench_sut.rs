@@ -162,6 +162,7 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
         codec_name: "VP8".to_string(),
         clock_rate: 90000,
         rtcp_fbs: vec![],
+        ..Default::default()
     }];
     config.media_capabilities = Some(caps);
 

@@ -127,6 +127,7 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
         codec_name: "VP8".to_string(),
         clock_rate: 90000,
         rtcp_fbs: vec!["nack pli".to_string(), "transport-cc".to_string()],
+        ..Default::default()
     }];
     config.media_capabilities = Some(caps);
 
