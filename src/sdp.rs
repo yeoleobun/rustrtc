@@ -732,13 +732,20 @@ impl MediaSection {
             self.attributes.push(Attribute::new("rtcp-mux", None));
         }
         for audio in &caps {
-            self.attributes.push(Attribute::new(
-                "rtpmap",
-                Some(format!(
+            let rtpmap_value = if audio.channels == 1 {
+                format!(
+                    "{} {}/{}",
+                    audio.payload_type, audio.codec_name, audio.clock_rate
+                )
+            } else {
+                format!(
                     "{} {}/{}/{}",
                     audio.payload_type, audio.codec_name, audio.clock_rate, audio.channels
-                )),
-            ));
+                )
+            };
+
+            self.attributes
+                .push(Attribute::new("rtpmap", Some(rtpmap_value)));
             if let Some(fmtp) = &audio.fmtp {
                 self.attributes.push(Attribute::new(
                     "fmtp",
