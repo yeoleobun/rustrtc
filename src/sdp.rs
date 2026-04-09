@@ -183,6 +183,48 @@ impl SessionDescription {
 
         Ok(fingerprint)
     }
+
+    /// Returns all video media sections.
+    pub fn video_sections(&self) -> impl Iterator<Item = &MediaSection> {
+        self.media_sections
+            .iter()
+            .filter(|s| s.kind == MediaKind::Video)
+    }
+
+    /// Returns all audio media sections.
+    pub fn audio_sections(&self) -> impl Iterator<Item = &MediaSection> {
+        self.media_sections
+            .iter()
+            .filter(|s| s.kind == MediaKind::Audio)
+    }
+
+    /// Returns the first video media section, if any.
+    pub fn first_video_section(&self) -> Option<&MediaSection> {
+        self.media_sections
+            .iter()
+            .find(|s| s.kind == MediaKind::Video)
+    }
+
+    /// Returns the first audio media section, if any.
+    pub fn first_audio_section(&self) -> Option<&MediaSection> {
+        self.media_sections
+            .iter()
+            .find(|s| s.kind == MediaKind::Audio)
+    }
+
+    /// Extracts all video capabilities from all video media sections.
+    pub fn to_video_capabilities(&self) -> Vec<crate::config::VideoCapability> {
+        self.video_sections()
+            .flat_map(|s| s.to_video_capabilities())
+            .collect()
+    }
+
+    /// Extracts all audio capabilities from all audio media sections.
+    pub fn to_audio_capabilities(&self) -> Vec<crate::config::AudioCapability> {
+        self.audio_sections()
+            .flat_map(|s| s.to_audio_capabilities())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -707,6 +749,214 @@ impl MediaSection {
         None
     }
 
+    pub fn to_video_capabilities(&self) -> Vec<crate::config::VideoCapability> {
+        if self.kind != MediaKind::Video {
+            return Vec::new();
+        }
+
+        let mut capabilities = Vec::new();
+
+        for fmt in &self.formats {
+            let payload_type: u8 = match fmt.parse() {
+                Ok(pt) => pt,
+                Err(_) => continue,
+            };
+
+            // Parse rtpmap for this payload type
+            let mut codec_name = String::new();
+            let mut clock_rate = 90000u32; // Default for video
+
+            for attr in &self.attributes {
+                if attr.key == "rtpmap" {
+                    if let Some(value) = &attr.value {
+                        if let Some((pt_part, rest)) = value.split_once(' ') {
+                            if let Ok(pt) = pt_part.parse::<u8>() {
+                                if pt == payload_type {
+                                    // Parse "codec_name/clock_rate"
+                                    let parts: Vec<&str> = rest.split('/').collect();
+                                    if !parts.is_empty() {
+                                        codec_name = parts[0].to_string();
+                                    }
+                                    if parts.len() >= 2 {
+                                        if let Ok(rate) = parts[1].parse() {
+                                            clock_rate = rate;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If no rtpmap found, use payload type to guess
+            if codec_name.is_empty() {
+                codec_name = match payload_type {
+                    96 | 97 | 98 => "VP8",
+                    99 | 100 => "H264",
+                    101 => "VP9",
+                    102 => "AV1",
+                    _ => "unknown",
+                }
+                .to_string();
+            }
+
+            // Parse fmtp for this payload type
+            let mut fmtp = None;
+            for attr in &self.attributes {
+                if attr.key == "fmtp" {
+                    if let Some(value) = &attr.value {
+                        if let Some((pt_part, rest)) = value.split_once(' ') {
+                            if let Ok(pt) = pt_part.parse::<u8>() {
+                                if pt == payload_type {
+                                    fmtp = Some(rest.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Parse rtcp-fb for this payload type
+            let mut rtcp_fbs = Vec::new();
+            for attr in &self.attributes {
+                if attr.key == "rtcp-fb" {
+                    if let Some(value) = &attr.value {
+                        if let Some((pt_part, rest)) = value.split_once(' ') {
+                            if let Ok(pt) = pt_part.parse::<u8>() {
+                                if pt == payload_type {
+                                    rtcp_fbs.push(rest.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            capabilities.push(crate::config::VideoCapability {
+                payload_type,
+                codec_name,
+                clock_rate,
+                fmtp,
+                rtcp_fbs,
+            });
+        }
+
+        capabilities
+    }
+
+    pub fn to_audio_capabilities(&self) -> Vec<crate::config::AudioCapability> {
+        if self.kind != MediaKind::Audio {
+            return Vec::new();
+        }
+
+        let mut capabilities = Vec::new();
+
+        for fmt in &self.formats {
+            let payload_type: u8 = match fmt.parse() {
+                Ok(pt) => pt,
+                Err(_) => continue,
+            };
+
+            // Parse rtpmap for this payload type
+            let mut codec_name = String::new();
+            let mut clock_rate = 8000u32; // Default for audio
+            let mut channels = 1u8;
+
+            for attr in &self.attributes {
+                if attr.key == "rtpmap" {
+                    if let Some(value) = &attr.value {
+                        if let Some((pt_part, rest)) = value.split_once(' ') {
+                            if let Ok(pt) = pt_part.parse::<u8>() {
+                                if pt == payload_type {
+                                    // Parse "codec_name/clock_rate[/channels]"
+                                    let parts: Vec<&str> = rest.split('/').collect();
+                                    if !parts.is_empty() {
+                                        codec_name = parts[0].to_string();
+                                    }
+                                    if parts.len() >= 2 {
+                                        if let Ok(rate) = parts[1].parse() {
+                                            clock_rate = rate;
+                                        }
+                                    }
+                                    if parts.len() >= 3 {
+                                        if let Ok(ch) = parts[2].parse() {
+                                            channels = ch;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If no rtpmap found, use payload type to guess common audio codecs
+            // These defaults match AudioCapability::{opus,pcmu,pcma,g722,g729,telephone_event}
+            if codec_name.is_empty() {
+                (codec_name, clock_rate, channels) = match payload_type {
+                    0 => ("PCMU".to_string(), 8000, 1),
+                    8 => ("PCMA".to_string(), 8000, 1),
+                    9 => ("G722".to_string(), 8000, 1),
+                    18 => ("G729".to_string(), 8000, 1),
+                    111 => ("opus".to_string(), 48000, 2),
+                    101 => ("telephone-event".to_string(), 8000, 1),
+                    _ => ("unknown".to_string(), 8000, 1),
+                };
+            }
+
+            // Parse fmtp for this payload type
+            let mut fmtp = None;
+            for attr in &self.attributes {
+                if attr.key == "fmtp" {
+                    if let Some(value) = &attr.value {
+                        if let Some((pt_part, rest)) = value.split_once(' ') {
+                            if let Ok(pt) = pt_part.parse::<u8>() {
+                                if pt == payload_type {
+                                    fmtp = Some(rest.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Default fmtp for telephone-event (matches AudioCapability::telephone_event)
+            if fmtp.is_none() && payload_type == 101 {
+                fmtp = Some("0-16".to_string());
+            }
+
+            // Parse rtcp-fb for this payload type
+            let mut rtcp_fbs = Vec::new();
+            for attr in &self.attributes {
+                if attr.key == "rtcp-fb" {
+                    if let Some(value) = &attr.value {
+                        if let Some((pt_part, rest)) = value.split_once(' ') {
+                            if let Ok(pt) = pt_part.parse::<u8>() {
+                                if pt == payload_type {
+                                    rtcp_fbs.push(rest.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            capabilities.push(crate::config::AudioCapability {
+                payload_type,
+                codec_name,
+                clock_rate,
+                channels,
+                fmtp,
+                rtcp_fbs,
+            });
+        }
+
+        capabilities
+    }
+
     pub fn apply_config(&mut self, config: &RtcConfiguration) {
         match self.kind {
             MediaKind::Audio => self.apply_audio_config(config),
@@ -1195,5 +1445,234 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             section.attributes.iter().any(|a| a.key == "rtcp-mux"),
             "Standard mode with Require policy must emit a=rtcp-mux"
         );
+    }
+
+    // ── Media section filtering tests ────────────────────────────────────────
+
+    #[test]
+    fn test_first_video_section_returns_video() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:1\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+
+        assert!(desc.first_audio_section().is_some());
+        assert!(desc.first_video_section().is_some());
+        assert_eq!(desc.first_video_section().unwrap().mid, "1");
+        assert_eq!(desc.first_audio_section().unwrap().mid, "0");
+    }
+
+    #[test]
+    fn test_first_video_section_returns_none_when_no_video() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+
+        assert!(desc.first_video_section().is_none());
+        assert!(desc.first_audio_section().is_some());
+    }
+
+    #[test]
+    fn test_video_sections_iterates_all_video() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:1\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 97\r\n\
+a=mid:2\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+
+        let videos: Vec<_> = desc.video_sections().collect();
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].mid, "1");
+        assert_eq!(videos[1].mid, "2");
+
+        let audios: Vec<_> = desc.audio_sections().collect();
+        assert_eq!(audios.len(), 1);
+        assert_eq!(audios[0].mid, "0");
+    }
+
+    // ── Capability parsing tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_video_capabilities_from_sdp() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+a=mid:0\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 H264/90000\r\n\
+a=fmtp:97 packetization-mode=1;profile-level-id=42e01f\r\n\
+a=rtcp-fb:96 nack pli\r\n\
+a=rtcp-fb:97 nack pli\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let caps = desc.to_video_capabilities();
+
+        assert_eq!(caps.len(), 2);
+
+        // First codec: VP8
+        assert_eq!(caps[0].payload_type, 96);
+        assert_eq!(caps[0].codec_name, "VP8");
+        assert_eq!(caps[0].clock_rate, 90000);
+        assert!(caps[0].fmtp.is_none());
+        assert_eq!(caps[0].rtcp_fbs, vec!["nack pli"]);
+
+        // Second codec: H264
+        assert_eq!(caps[1].payload_type, 97);
+        assert_eq!(caps[1].codec_name, "H264");
+        assert_eq!(caps[1].clock_rate, 90000);
+        assert_eq!(
+            caps[1].fmtp.as_deref().unwrap(),
+            "packetization-mode=1;profile-level-id=42e01f"
+        );
+        assert_eq!(caps[1].rtcp_fbs, vec!["nack pli"]);
+    }
+
+    #[test]
+    fn test_parse_audio_capabilities_from_sdp() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111 0\r\n\
+a=mid:0\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let caps = desc.to_audio_capabilities();
+
+        assert_eq!(caps.len(), 2);
+
+        // First codec: opus
+        assert_eq!(caps[0].payload_type, 111);
+        assert_eq!(caps[0].codec_name, "opus");
+        assert_eq!(caps[0].clock_rate, 48000);
+        assert_eq!(caps[0].channels, 2);
+        assert_eq!(
+            caps[0].fmtp.as_deref().unwrap(),
+            "minptime=10;useinbandfec=1"
+        );
+
+        // Second codec: PCMU
+        assert_eq!(caps[1].payload_type, 0);
+        assert_eq!(caps[1].codec_name, "PCMU");
+        assert_eq!(caps[1].clock_rate, 8000);
+        assert_eq!(caps[1].channels, 1);
+    }
+
+    #[test]
+    fn test_parse_capabilities_empty_for_wrong_kind() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+a=rtpmap:111 opus/48000/2\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let audio_section = desc.first_audio_section().unwrap();
+
+        // Video capabilities should be empty for audio section
+        let video_caps = audio_section.to_video_capabilities();
+        assert!(video_caps.is_empty());
+
+        // But audio capabilities should work
+        let audio_caps = audio_section.to_audio_capabilities();
+        assert_eq!(audio_caps.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_video_capability_without_rtpmap() {
+        // Test fallback when rtpmap is missing
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:0\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let caps = desc.to_video_capabilities();
+
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].payload_type, 96);
+        // Should use fallback codec name
+        assert!(!caps[0].codec_name.is_empty());
+        assert_eq!(caps[0].clock_rate, 90000); // Default for video
+    }
+
+    #[test]
+    fn test_audio_capability_fallback_matches_defaults() {
+        // Verify fallback values match AudioCapability constructors
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 0 8 9 18 111 101\r\n\
+a=mid:0\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let caps = desc.to_audio_capabilities();
+
+        assert_eq!(caps.len(), 6);
+
+        // PT 0 = PCMU (matches AudioCapability::pcmu)
+        assert_eq!(caps[0].payload_type, 0);
+        assert_eq!(caps[0].codec_name, "PCMU");
+        assert_eq!(caps[0].clock_rate, 8000);
+        assert_eq!(caps[0].channels, 1);
+
+        // PT 8 = PCMA (matches AudioCapability::pcma)
+        assert_eq!(caps[1].payload_type, 8);
+        assert_eq!(caps[1].codec_name, "PCMA");
+        assert_eq!(caps[1].clock_rate, 8000);
+        assert_eq!(caps[1].channels, 1);
+
+        // PT 9 = G722 (matches AudioCapability::g722)
+        assert_eq!(caps[2].payload_type, 9);
+        assert_eq!(caps[2].codec_name, "G722");
+        assert_eq!(caps[2].clock_rate, 8000);
+        assert_eq!(caps[2].channels, 1);
+
+        // PT 18 = G729 (matches AudioCapability::g729)
+        assert_eq!(caps[3].payload_type, 18);
+        assert_eq!(caps[3].codec_name, "G729");
+        assert_eq!(caps[3].clock_rate, 8000);
+        assert_eq!(caps[3].channels, 1);
+
+        // PT 111 = opus (matches AudioCapability::opus/default)
+        assert_eq!(caps[4].payload_type, 111);
+        assert_eq!(caps[4].codec_name, "opus");
+        assert_eq!(caps[4].clock_rate, 48000);
+        assert_eq!(caps[4].channels, 2); // Important: opus has 2 channels by default
+
+        // PT 101 = telephone-event (matches AudioCapability::telephone_event)
+        assert_eq!(caps[5].payload_type, 101);
+        assert_eq!(caps[5].codec_name, "telephone-event");
+        assert_eq!(caps[5].clock_rate, 8000);
+        assert_eq!(caps[5].channels, 1);
+        assert_eq!(caps[5].fmtp.as_deref(), Some("0-16")); // Default fmtp for telephone-event
     }
 }
