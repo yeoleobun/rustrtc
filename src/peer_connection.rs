@@ -3217,8 +3217,7 @@ impl PeerConnectionInner {
             // In LegacySip mode, never BUNDLE (SIP endpoints typically don't support it).
             let should_bundle = should_bundle
                 && desc.media_sections.len() > 1
-                && self.config.sdp_compatibility
-                    != crate::config::SdpCompatibilityMode::LegacySip;
+                && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
 
             if should_bundle {
                 let mids: Vec<String> = desc.media_sections.iter().map(|m| m.mid.clone()).collect();
@@ -3344,6 +3343,21 @@ impl PeerConnectionInner {
                 "extmap",
                 Some(format!("{} {}", id, crate::sdp::ABS_SEND_TIME_URI)),
             ));
+        }
+
+        // Add sdes:mid extmap for BUNDLE support (RFC 8843).
+        // When the remote endpoint offered sdes:mid (e.g. Linphone in BUNDLE mode),
+        // echo the same extension ID back in the answer so the remote knows we
+        // support it.  Without this, Linphone's RtpBundle cannot register our
+        // SSRCs and drops every incoming packet ("SSRC not found" warnings).
+        // Only add in Standard/WebRTC mode; LegacySip never uses BUNDLE.
+        if self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip {
+            if let Some(id) = self.get_remote_extmap_id(&section.mid, crate::sdp::SDES_MID_URI) {
+                section.attributes.push(crate::sdp::Attribute::new(
+                    "extmap",
+                    Some(format!("{} {}", id, crate::sdp::SDES_MID_URI)),
+                ));
+            }
         }
 
         if self.config.transport_mode != TransportMode::Rtp {
@@ -3696,6 +3710,9 @@ pub struct RtpTransceiver {
     sender_track_id: Mutex<Option<String>>,
     payload_map: Arc<RwLock<HashMap<u8, RtpCodecParameters>>>,
     extmap: Arc<RwLock<HashMap<u8, String>>>,
+    /// Deferred sdes:mid configuration: stored here when update_extmap() is called
+    /// but the sender has not been created yet.  Applied in set_sender().
+    pending_sdes_mid: Mutex<Option<(u8, Arc<str>)>>,
 }
 
 impl RtpTransceiver {
@@ -3713,6 +3730,7 @@ impl RtpTransceiver {
             sender_track_id: Mutex::new(None),
             payload_map: Arc::new(RwLock::new(HashMap::new())),
             extmap: Arc::new(RwLock::new(HashMap::new())),
+            pending_sdes_mid: Mutex::new(None),
         }
     }
 
@@ -3778,6 +3796,12 @@ impl RtpTransceiver {
             *self.sender_ssrc.lock() = Some(s.ssrc());
             *self.sender_stream_id.lock() = Some(s.stream_id().to_string());
             *self.sender_track_id.lock() = Some(s.track_id().to_string());
+
+            // Apply any deferred sdes:mid configuration that arrived via update_extmap()
+            // before the sender existed (e.g. when the remote offer was processed first).
+            if let Some((id, mid_val)) = self.pending_sdes_mid.lock().take() {
+                s.set_sdes_mid(id, mid_val);
+            }
         }
         *self.sender.lock() = sender;
     }
@@ -3857,6 +3881,28 @@ impl RtpTransceiver {
             }
         }
 
+        // Propagate sdes:mid to the sender so it auto-injects the extension on every outgoing packet
+        if let Some(sender_arc) = self.sender.lock().as_ref() {
+            let mid_value = self.mid.lock().clone();
+            let sdes_mid_id = extmap
+                .iter()
+                .find(|(_, uri)| uri.as_str() == crate::sdp::SDES_MID_URI)
+                .map(|(id, _)| *id);
+            if let (Some(id), Some(mid)) = (sdes_mid_id, mid_value) {
+                sender_arc.set_sdes_mid(id, Arc::from(mid.as_str()));
+            }
+        } else {
+            // Sender not yet created — defer sdes:mid so set_sender() can apply it.
+            let mid_value = self.mid.lock().clone();
+            let sdes_mid_id = extmap
+                .iter()
+                .find(|(_, uri)| uri.as_str() == crate::sdp::SDES_MID_URI)
+                .map(|(id, _)| *id);
+            if let (Some(id), Some(mid)) = (sdes_mid_id, mid_value) {
+                *self.pending_sdes_mid.lock() = Some((id, Arc::from(mid.as_str())));
+            }
+        }
+
         Ok(())
     }
 
@@ -3886,6 +3932,9 @@ pub struct RtpSender {
     octets_sent: Arc<AtomicU32>,
     last_rtp_timestamp: Arc<AtomicU32>,
     interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
+    /// sdes:mid extension to inject: (extension header ID, mid value).
+    /// Set automatically by update_extmap() when negotiation contains sdes:mid.
+    sdes_mid: Arc<Mutex<Option<(u8, Arc<str>)>>>,
 }
 
 pub struct RtpSenderBuilder {
@@ -3987,6 +4036,7 @@ impl RtpSender {
             octets_sent: Arc::new(AtomicU32::new(0)),
             last_rtp_timestamp: Arc::new(AtomicU32::new(0)),
             interceptors,
+            sdes_mid: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4004,6 +4054,10 @@ impl RtpSender {
 
     pub fn stream_id(&self) -> &str {
         &self.stream_id
+    }
+
+    pub fn set_sdes_mid(&self, ext_id: u8, mid: Arc<str>) {
+        *self.sdes_mid.lock() = Some((ext_id, mid));
     }
 
     pub fn subscribe_rtcp(&self) -> broadcast::Receiver<RtcpPacket> {
@@ -4059,6 +4113,7 @@ impl RtpSender {
         let octets_sent = self.octets_sent.clone();
         let last_rtp_timestamp = self.last_rtp_timestamp.clone();
         let interceptors = self.interceptors.clone();
+        let sdes_mid = self.sdes_mid.clone();
         let mut rtcp_rx = self.rtcp_tx.subscribe();
 
         tokio::spawn(async move {
@@ -4179,6 +4234,11 @@ impl RtpSender {
 
                                 for interceptor in &interceptors {
                                     interceptor.on_packet_sent(&packet).await;
+                                }
+
+                                // Auto-inject sdes:mid header extension when negotiated (RFC 8843 / BUNDLE).
+                                if let Some((id, ref mid)) = *sdes_mid.lock() {
+                                    let _ = packet.header.set_extension(id, mid.as_bytes());
                                 }
 
                                 let payload_len = packet.payload.len() as u32;
@@ -4670,7 +4730,7 @@ impl RtpReceiver {
                                                 let mut s = this.ssrc.lock();
                                                 let old_ssrc = *s;
                                                 if old_ssrc != packet.header.ssrc {
-                                                    debug!(
+                                                    trace!(
                                                         "RTP main track SSRC changed from {} to {}",
                                                         old_ssrc, packet.header.ssrc
                                                     );
@@ -6664,8 +6724,8 @@ a=mid:0
     /// H264 fmtp (profile-level-id, packetization-mode) must appear in the offer SDP.
     #[tokio::test]
     async fn offer_h264_emits_fmtp_in_sdp() {
-        use crate::config::{MediaCapabilities, VideoCapability};
         use crate::TransportMode;
+        use crate::config::{MediaCapabilities, VideoCapability};
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
@@ -6687,12 +6747,18 @@ a=mid:0
             .find(|a| a.key == "fmtp")
             .expect("H264 offer must contain a=fmtp");
         assert!(
-            fmtp.value.as_deref().unwrap_or("").contains("packetization-mode"),
+            fmtp.value
+                .as_deref()
+                .unwrap_or("")
+                .contains("packetization-mode"),
             "a=fmtp must contain packetization-mode, got: {:?}",
             fmtp.value
         );
         assert!(
-            fmtp.value.as_deref().unwrap_or("").contains("profile-level-id"),
+            fmtp.value
+                .as_deref()
+                .unwrap_or("")
+                .contains("profile-level-id"),
             "a=fmtp must contain profile-level-id, got: {:?}",
             fmtp.value
         );
@@ -6701,8 +6767,8 @@ a=mid:0
     /// When fmtp is None, no a=fmtp line should appear in the video section.
     #[tokio::test]
     async fn offer_vp8_no_fmtp_in_sdp() {
-        use crate::config::{MediaCapabilities, VideoCapability};
         use crate::TransportMode;
+        use crate::config::{MediaCapabilities, VideoCapability};
 
         let vp8 = VideoCapability {
             fmtp: None,
@@ -6731,8 +6797,8 @@ a=mid:0
     /// H264 rtcp-fb entries (nack pli, ccm fir) must appear in the offer SDP.
     #[tokio::test]
     async fn offer_h264_emits_rtcp_fb_in_sdp() {
-        use crate::config::{MediaCapabilities, VideoCapability};
         use crate::TransportMode;
+        use crate::config::{MediaCapabilities, VideoCapability};
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
@@ -6768,8 +6834,8 @@ a=mid:0
     /// In LegacySip mode the generated offer must not contain any a=mid or a=rtcp-mux.
     #[tokio::test]
     async fn legacy_sip_offer_omits_mid_and_rtcp_mux() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
         use crate::TransportMode;
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
@@ -6802,8 +6868,8 @@ a=mid:0
     /// Standard mode with two media sections MUST produce a=group:BUNDLE and a=mid.
     #[tokio::test]
     async fn standard_mode_multi_section_includes_bundle_and_mid() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
         use crate::TransportMode;
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
@@ -6833,8 +6899,8 @@ a=mid:0
     /// In LegacySip mode with two media sections, no BUNDLE and no a=mid.
     #[tokio::test]
     async fn legacy_sip_multi_section_no_bundle_no_mid() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
         use crate::TransportMode;
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
@@ -6866,8 +6932,8 @@ a=mid:0
     /// contain a=mid in the sections (Standard mode).
     #[tokio::test]
     async fn answer_to_non_bundle_offer_omits_mid_in_sections() {
-        use crate::config::{AudioCapability, MediaCapabilities};
         use crate::TransportMode;
+        use crate::config::{AudioCapability, MediaCapabilities};
 
         // No a=group:BUNDLE in this remote offer (traditional SIP style)
         let remote_sdp = "v=0\r\n\

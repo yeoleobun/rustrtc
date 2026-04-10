@@ -21,17 +21,18 @@ pub use peer_connection::{
     TransceiverDirection,
 };
 pub use sdp::{
-    AddressType, Attribute, Direction, MediaKind, MediaSection, NetworkType, Origin, SdpType,
-    SessionDescription, SessionSection, Timing,
+    AddressType, Attribute, Direction, MediaKind, MediaSection, NetworkType, Origin, SDES_MID_URI,
+    SdpType, SessionDescription, SessionSection, Timing, modify_sdp_direction,
+    parse_bundle_mid_info,
 };
 pub use srtp::{SrtpContext, SrtpDirection, SrtpKeyingMaterial, SrtpProfile, SrtpSession};
 pub use stats::{
     DynProvider, StatsEntry, StatsId, StatsKind, StatsProvider, StatsReport, gather_once,
 };
 pub use transports::ice::{
-    IceCandidate, IceCandidatePair, IceCandidateType, IceGathererState, IceRole, IceTransport,
-    IceTransportState, UpnpPortMapper, DEFAULT_LEASE_DURATION, DEFAULT_UPNP_DISCOVERY_TIMEOUT,
-    MAX_LEASE_DURATION, MIN_LEASE_DURATION,
+    DEFAULT_LEASE_DURATION, DEFAULT_UPNP_DISCOVERY_TIMEOUT, IceCandidate, IceCandidatePair,
+    IceCandidateType, IceGathererState, IceRole, IceTransport, IceTransportState,
+    MAX_LEASE_DURATION, MIN_LEASE_DURATION, UpnpPortMapper,
 };
 pub use transports::rtp::RtpRewriteBridgeParams;
 pub use transports::sctp::{DataChannelEvent, DataChannelState};

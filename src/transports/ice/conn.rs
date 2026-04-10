@@ -3,10 +3,10 @@ use crate::transports::PacketReceiver;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use parking_lot::RwLock;
 use tokio::sync::watch;
 use tracing::debug;
 
@@ -118,7 +118,7 @@ impl IceConn {
                 }
                 socket.send_to(buf, remote).await
             } else {
-                tracing::warn!("IceConn: send_rtcp failed - no selected socket");
+                tracing::debug!("IceConn: send_rtcp failed - no selected socket");
                 Err(anyhow::anyhow!("No selected socket"))
             }
         }
@@ -346,10 +346,7 @@ mod tests {
         let conn = IceConn::new(rx, rtp_addr);
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
-        conn.set_remote_rtcp_addr(Some(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            4001,
-        )));
+        conn.set_remote_rtcp_addr(Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4001)));
 
         let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
         conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)
@@ -361,8 +358,11 @@ mod tests {
         assert_eq!(*conn.remote_rtcp_addr.read(), Some(rtcp_src));
 
         let rogue_rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6001);
-        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rogue_rtcp_src)
-            .await;
+        conn.receive(
+            Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]),
+            rogue_rtcp_src,
+        )
+        .await;
 
         assert_eq!(
             *conn.remote_rtcp_addr.read(),
@@ -400,10 +400,7 @@ mod tests {
         let conn = IceConn::new(rx, rtp_addr);
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
-        conn.set_remote_rtcp_addr(Some(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            4001,
-        )));
+        conn.set_remote_rtcp_addr(Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4001)));
 
         let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
         conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)

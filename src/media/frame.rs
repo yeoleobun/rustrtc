@@ -29,6 +29,8 @@ pub struct AudioFrame {
     pub payload_type: Option<u8>,
     pub marker: bool,
     #[serde(skip)]
+    pub header_extension: Option<RtpHeaderExtension>,
+    #[serde(skip)]
     pub source_addr: Option<SocketAddr>,
     #[serde(skip)]
     pub raw_packet: Option<RtpPacket>,
@@ -43,6 +45,7 @@ impl Default for AudioFrame {
             sequence_number: None,
             payload_type: None,
             marker: false,
+            header_extension: None,
             source_addr: None,
             raw_packet: None,
         }
@@ -116,7 +119,7 @@ impl MediaSample {
                 Vec::new(),
                 f.sequence_number,
                 f.payload_type,
-                None,
+                f.header_extension,
             ),
             MediaSample::Video(f) => (
                 f.data,
@@ -160,6 +163,7 @@ impl MediaSample {
                 sequence_number: Some(packet.header.sequence_number),
                 payload_type: Some(packet.header.payload_type),
                 marker: packet.header.marker,
+                header_extension: packet.header.extension,
                 source_addr: Some(addr),
                 raw_packet: Some(raw_packet),
             }),

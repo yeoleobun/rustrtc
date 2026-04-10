@@ -7,6 +7,7 @@ use std::{
 };
 
 pub const ABS_SEND_TIME_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
+pub const SDES_MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -1178,6 +1179,79 @@ impl MediaSection {
     }
 }
 
+/// Rewrite every direction attribute (`sendrecv`, `sendonly`, `recvonly`, `inactive`)
+/// inside every media section of a raw SDP string to the given `direction`.
+///
+/// Non-direction lines are preserved verbatim.  Output uses `\r\n` line endings to
+/// comply with RFC 4566.
+pub fn modify_sdp_direction(sdp: &str, direction: &str) -> String {
+    let mut result: Vec<String> = Vec::new();
+    let mut in_media_section = false;
+
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            in_media_section = true;
+            result.push(line.to_string());
+        } else if in_media_section
+            && matches!(
+                line,
+                s if s.starts_with("a=sendrecv")
+                    || s.starts_with("a=sendonly")
+                    || s.starts_with("a=recvonly")
+                    || s.starts_with("a=inactive")
+            )
+        {
+            result.push(format!("a={}", direction));
+        } else {
+            result.push(line.to_string());
+        }
+    }
+
+    result.join("\r\n")
+}
+
+pub fn parse_bundle_mid_info(sdp: &str) -> Option<(u8, String, String)> {
+    let mut extmap_id: Option<u8> = None;
+    let mut audio_mid: Option<String> = None;
+    let mut video_mid: Option<String> = None;
+    let mut in_audio = false;
+    let mut in_video = false;
+
+    for line in sdp.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with("m=audio") {
+            in_audio = true;
+            in_video = false;
+        } else if line.starts_with("m=video") {
+            in_audio = false;
+            in_video = true;
+        } else if line.starts_with("m=") {
+            in_audio = false;
+            in_video = false;
+        } else if let Some(mid) = line.strip_prefix("a=mid:") {
+            if in_audio && audio_mid.is_none() {
+                audio_mid = Some(mid.to_string());
+            } else if in_video && video_mid.is_none() {
+                video_mid = Some(mid.to_string());
+            }
+        } else if extmap_id.is_none() && line.starts_with("a=extmap:") && line.contains("sdes:mid")
+        {
+            if let Some(rest) = line.strip_prefix("a=extmap:") {
+                if let Some(id_str) = rest.split(|c: char| c == ' ' || c == '/').next() {
+                    if let Ok(id) = id_str.parse::<u8>() {
+                        extmap_id = Some(id);
+                    }
+                }
+            }
+        }
+    }
+
+    match (extmap_id, audio_mid, video_mid) {
+        (Some(id), Some(a), Some(v)) => Some((id, a, v)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1674,5 +1748,148 @@ a=mid:0\r\n";
         assert_eq!(caps[5].clock_rate, 8000);
         assert_eq!(caps[5].channels, 1);
         assert_eq!(caps[5].fmtp.as_deref(), Some("0-16")); // Default fmtp for telephone-event
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for modify_sdp_direction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_modify_sdp_direction_sendrecv_to_sendonly() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 1234 RTP/AVP 0\r\n\
+a=sendrecv\r\n\
+m=video 5678 RTP/AVP 96\r\n\
+a=sendrecv\r\n";
+
+        let result = modify_sdp_direction(sdp, "sendonly");
+        assert!(
+            result.contains("a=sendonly"),
+            "Direction should be sendonly"
+        );
+        assert!(!result.contains("a=sendrecv"), "sendrecv should be gone");
+    }
+
+    #[test]
+    fn test_modify_sdp_direction_sendonly_to_sendrecv() {
+        let sdp = "v=0\r\nm=audio 1234 RTP/AVP 0\r\na=sendonly\r\n";
+        let result = modify_sdp_direction(sdp, "sendrecv");
+        assert!(result.contains("a=sendrecv"));
+        assert!(!result.contains("a=sendonly"));
+    }
+
+    #[test]
+    fn test_modify_sdp_direction_recvonly() {
+        let sdp = "v=0\r\nm=audio 1234 RTP/AVP 0\r\na=recvonly\r\n";
+        let result = modify_sdp_direction(sdp, "sendrecv");
+        assert!(result.contains("a=sendrecv"));
+        assert!(!result.contains("a=recvonly"));
+    }
+
+    #[test]
+    fn test_modify_sdp_direction_inactive() {
+        let sdp = "v=0\r\nm=audio 1234 RTP/AVP 0\r\na=inactive\r\n";
+        let result = modify_sdp_direction(sdp, "sendrecv");
+        assert!(result.contains("a=sendrecv"));
+        assert!(!result.contains("a=inactive"));
+    }
+
+    #[test]
+    fn test_modify_sdp_direction_no_direction_line() {
+        // SDP without any direction attribute must pass through unchanged
+        let sdp = "v=0\r\nm=audio 1234 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let result = modify_sdp_direction(sdp, "sendonly");
+        assert!(result.contains("a=rtpmap:0 PCMU/8000"));
+        assert!(!result.contains("a=sendonly"));
+    }
+
+    #[test]
+    fn test_modify_sdp_direction_preserves_other_attrs() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 1234 RTP/AVP 0\r\n\
+c=IN IP4 192.0.2.1\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=fmtp:0 mode=30\r\n\
+a=sendrecv\r\n";
+
+        let result = modify_sdp_direction(sdp, "sendonly");
+        assert!(result.contains("c=IN IP4 192.0.2.1"));
+        assert!(result.contains("a=rtpmap:0 PCMU/8000"));
+        assert!(result.contains("a=fmtp:0 mode=30"));
+        assert!(result.contains("a=sendonly"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for parse_bundle_mid_info
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_bundle_mid_info_linphone_style() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE as vs\r\n\
+a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+m=audio 10000 RTP/AVP 0\r\n\
+a=mid:as\r\n\
+m=video 10002 RTP/AVP 96\r\n\
+a=mid:vs\r\n";
+
+        let result = parse_bundle_mid_info(sdp);
+        assert_eq!(result, Some((1u8, "as".to_string(), "vs".to_string())));
+    }
+
+    #[test]
+    fn test_parse_bundle_mid_info_extmap_in_media_section() {
+        // extmap can appear inside a media section too
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+m=audio 10000 RTP/AVP 0\r\n\
+a=extmap:2 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+a=mid:audio\r\n\
+m=video 10002 RTP/AVP 96\r\n\
+a=mid:video\r\n";
+
+        let result = parse_bundle_mid_info(sdp);
+        assert_eq!(
+            result,
+            Some((2u8, "audio".to_string(), "video".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_bundle_mid_info_missing_extmap() {
+        let sdp = "v=0\r\n\
+m=audio 10000 RTP/AVP 0\r\n\
+a=mid:as\r\n\
+m=video 10002 RTP/AVP 96\r\n\
+a=mid:vs\r\n";
+
+        assert!(parse_bundle_mid_info(sdp).is_none());
+    }
+
+    #[test]
+    fn test_parse_bundle_mid_info_missing_video_mid() {
+        let sdp = "v=0\r\n\
+a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+m=audio 10000 RTP/AVP 0\r\n\
+a=mid:as\r\n";
+
+        assert!(parse_bundle_mid_info(sdp).is_none());
+    }
+
+    #[test]
+    fn test_parse_bundle_mid_info_crlf_and_lf_lines() {
+        // Mix of CRLF and LF line endings
+        let sdp = "v=0\r\na=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid\r\nm=audio 10000 RTP/AVP 0\r\na=mid:as\r\nm=video 10002 RTP/AVP 96\r\na=mid:vs\r\n";
+        let result = parse_bundle_mid_info(sdp);
+        assert_eq!(result, Some((1u8, "as".to_string(), "vs".to_string())));
     }
 }
