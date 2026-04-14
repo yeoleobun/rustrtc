@@ -7,8 +7,8 @@ pub mod upnp;
 
 // Re-export UPnP types
 pub use upnp::{
-    UpnpPortMapper, DEFAULT_LEASE_DURATION, DEFAULT_UPNP_DISCOVERY_TIMEOUT, MAX_LEASE_DURATION,
-    MIN_LEASE_DURATION,
+    DEFAULT_LEASE_DURATION, DEFAULT_UPNP_DISCOVERY_TIMEOUT, MAX_LEASE_DURATION, MIN_LEASE_DURATION,
+    UpnpPortMapper,
 };
 
 use crate::config::{BufferDropStrategy, IceServer, IceTransportPolicy, RtcConfiguration};
@@ -153,10 +153,7 @@ impl std::fmt::Debug for IceTransportInner {
             .field("remote_parameters", &self.remote_parameters)
             .field("pending_transactions", &self.pending_transactions)
             .field("data_receiver", &"PacketReceiver")
-            .field(
-                "buffered_packets",
-                &self.buffered_packets.lock().len(),
-            )
+            .field("buffered_packets", &self.buffered_packets.lock().len())
             .field("buffer_stats", &self.buffer_stats)
             .field("selected_socket", &self.selected_socket)
             .field("selected_pair_notifier", &self.selected_pair_notifier)
@@ -467,27 +464,18 @@ impl IceTransportRunner {
             tx_id: [u8; 12],
         ) -> Option<StunDecoded> {
             let (tx, rx) = oneshot::channel();
-            inner
-                .pending_transactions
-                .lock()
-                .insert(tx_id, tx);
+            inner.pending_transactions.lock().insert(tx_id, tx);
 
             if let Err(e) = client.send(&bytes).await {
                 debug!("TURN refresh send failed: {}", e);
-                inner
-                    .pending_transactions
-                    .lock()
-                    .remove(&tx_id);
+                inner.pending_transactions.lock().remove(&tx_id);
                 return None;
             }
 
             match timeout(Duration::from_secs(5), rx).await {
                 Ok(Ok(msg)) => Some(msg),
                 _ => {
-                    inner
-                        .pending_transactions
-                        .lock()
-                        .remove(&tx_id);
+                    inner.pending_transactions.lock().remove(&tx_id);
                     None
                 }
             }
@@ -504,8 +492,7 @@ impl IceTransportRunner {
                             break 'alloc;
                         }
                         Some(msg)
-                            if matches!(msg.error_code, Some(401) | Some(438))
-                                && attempt == 0 =>
+                            if matches!(msg.error_code, Some(401) | Some(438)) && attempt == 0 =>
                         {
                             // Stale nonce: update and retry
                             if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
@@ -535,36 +522,33 @@ impl IceTransportRunner {
         let remote_addr = pair.remote.address;
         'perm: for attempt in 0..2u8 {
             match client.create_permission_packet(remote_addr).await {
-                Ok((bytes, tx_id)) => {
-                    match send_and_await(&client, inner, bytes, tx_id).await {
-                        Some(msg) if msg.class == StunClass::SuccessResponse => {
-                            trace!("TURN permission refreshed for {}", remote_addr);
-                            break 'perm;
-                        }
-                        Some(msg)
-                            if matches!(msg.error_code, Some(401) | Some(438))
-                                && attempt == 0 =>
-                        {
-                            if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
-                                debug!(
-                                    "TURN CreatePermission got {}: updating nonce, retrying",
-                                    msg.error_code.unwrap()
-                                );
-                                client.update_nonce(realm, nonce).await;
-                            }
-                            continue 'perm;
-                        }
-                        Some(msg) => {
-                            debug!(
-                                "TURN CreatePermission refresh failed: error={:?}",
-                                msg.error_code
-                            );
-                        }
-                        None => {
-                            debug!("TURN CreatePermission refresh timeout or send error");
-                        }
+                Ok((bytes, tx_id)) => match send_and_await(&client, inner, bytes, tx_id).await {
+                    Some(msg) if msg.class == StunClass::SuccessResponse => {
+                        trace!("TURN permission refreshed for {}", remote_addr);
+                        break 'perm;
                     }
-                }
+                    Some(msg)
+                        if matches!(msg.error_code, Some(401) | Some(438)) && attempt == 0 =>
+                    {
+                        if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
+                            debug!(
+                                "TURN CreatePermission got {}: updating nonce, retrying",
+                                msg.error_code.unwrap()
+                            );
+                            client.update_nonce(realm, nonce).await;
+                        }
+                        continue 'perm;
+                    }
+                    Some(msg) => {
+                        debug!(
+                            "TURN CreatePermission refresh failed: error={:?}",
+                            msg.error_code
+                        );
+                    }
+                    None => {
+                        debug!("TURN CreatePermission refresh timeout or send error");
+                    }
+                },
                 Err(e) => debug!("TURN CreatePermission packet creation failed: {}", e),
             }
             break;
@@ -583,8 +567,7 @@ impl IceTransportRunner {
                                 Some(msg) if msg.class == StunClass::SuccessResponse => {
                                     trace!(
                                         "TURN ChannelBind refreshed: {} -> ch {}",
-                                        peer,
-                                        channel
+                                        peer, channel
                                     );
                                     break 'chan;
                                 }
@@ -605,8 +588,7 @@ impl IceTransportRunner {
                                 Some(msg) => {
                                     debug!(
                                         "TURN ChannelBind refresh failed: ch={} error={:?}",
-                                        channel,
-                                        msg.error_code
+                                        channel, msg.error_code
                                     );
                                 }
                                 None => {
@@ -618,10 +600,7 @@ impl IceTransportRunner {
                             }
                         }
                         Err(e) => {
-                            debug!(
-                                "TURN ChannelBind refresh packet creation failed: {}",
-                                e
-                            );
+                            debug!("TURN ChannelBind refresh packet creation failed: {}", e);
                         }
                     }
                     break;
@@ -868,11 +847,7 @@ impl IceTransport {
         let socket = Arc::new(socket);
 
         // Store the socket
-        self.inner
-            .gatherer
-            .sockets
-            .lock()
-            .push(socket.clone());
+        self.inner.gatherer.sockets.lock().push(socket.clone());
 
         // Register the socket wrapper for the read loop (handled by runner)
         let _ = self
@@ -886,7 +861,8 @@ impl IceTransport {
         let mut upnp_external_addr = None;
 
         // Try UPnP if enabled (for RTP mode behind NAT)
-        if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6() {
+        if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6()
+        {
             let mut mapper = UpnpPortMapper::with_lease_duration(
                 local_addr,
                 self.inner.config.upnp_lease_duration,
@@ -894,7 +870,10 @@ impl IceTransport {
             if let Err(e) = mapper.discover().await {
                 trace!("UPnP discovery failed for RTP mode: {}", e);
             } else if let Ok(ext_addr) = mapper.add_mapping(0).await {
-                debug!("UPnP mapping created for RTP mode: {} -> {}", local_addr, ext_addr);
+                debug!(
+                    "UPnP mapping created for RTP mode: {} -> {}",
+                    local_addr, ext_addr
+                );
                 cand_addr.set_ip(ext_addr.ip());
                 cand_addr.set_port(ext_addr.port());
                 upnp_external_addr = Some(ext_addr);
@@ -960,11 +939,7 @@ impl IceTransport {
         let local_addr = socket.local_addr()?;
         let socket = Arc::new(socket);
 
-        self.inner
-            .gatherer
-            .sockets
-            .lock()
-            .push(socket.clone());
+        self.inner.gatherer.sockets.lock().push(socket.clone());
         let _ = self
             .inner
             .gatherer
@@ -975,7 +950,8 @@ impl IceTransport {
         let mut upnp_external_addr = None;
 
         // Try UPnP if enabled (for RTP mode behind NAT)
-        if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6() {
+        if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6()
+        {
             let mut mapper = UpnpPortMapper::with_lease_duration(
                 local_addr,
                 self.inner.config.upnp_lease_duration,
@@ -983,7 +959,10 @@ impl IceTransport {
             if let Err(e) = mapper.discover().await {
                 trace!("UPnP discovery failed for RTP offer mode: {}", e);
             } else if let Ok(ext_addr) = mapper.add_mapping(0).await {
-                debug!("UPnP mapping created for RTP offer mode: {} -> {}", local_addr, ext_addr);
+                debug!(
+                    "UPnP mapping created for RTP offer mode: {} -> {}",
+                    local_addr, ext_addr
+                );
                 cand_addr.set_ip(ext_addr.ip());
                 cand_addr.set_port(ext_addr.port());
                 upnp_external_addr = Some(ext_addr);
@@ -1378,18 +1357,15 @@ async fn handle_packet(
         match StunMessage::decode(packet) {
             Ok(msg) => {
                 if msg.class == StunClass::Request {
-                    if inner.config.transport_mode == crate::TransportMode::Rtp
-                        && !inner.config.enable_ice_lite
-                        && !inner.config.enable_latching
-                    {
-                        debug!(
-                            remote_addr = %addr,
-                            method = ?msg.method,
-                            class = ?msg.class,
-                            "Rejecting STUN on RTP transport without ICE-lite or latching"
-                        );
-                        return;
-                    }
+                    // Always respond to STUN Binding Requests on any transport mode
+                    // (RFC 5389 compliance). Sending a Binding Response lets the remote
+                    // peer (e.g. Linphone) confirm the media port is reachable even when
+                    // it sends a STUN probe before its first real RTP packet.
+                    //
+                    // Address latching (updating the selected pair's remote IP based on
+                    // the incoming source) is a separate concern gated by
+                    // `enable_latching` inside handle_stun_request — it is NOT the same
+                    // as "should we even reply to this STUN message".
                     handle_stun_request(&sender, &msg, addr, inner).await;
                 } else if msg.class == StunClass::SuccessResponse {
                     let mut map = inner.pending_transactions.lock();
@@ -1575,50 +1551,60 @@ async fn handle_stun_request(
     if msg.use_candidate {
         let role = *inner.role.lock();
         if role == IceRole::Controlled {
-            let local_addr = match sender {
-                IceSocketWrapper::Udp(s) => s
-                    .local_addr()
-                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
-                IceSocketWrapper::Turn(_, addr) => *addr,
-            };
-
-            let locals = inner.gatherer.local_candidates();
-            let local_cand = locals.iter().find(|c| c.base_address() == local_addr);
-
-            let pair = {
-                let remotes = inner.remote_candidates.lock();
-                let remote_cand = remotes.iter().find(|c| c.address == addr);
-                if let (Some(l), Some(r)) = (local_cand, remote_cand) {
-                    Some(IceCandidatePair::new(l.clone(), r.clone()))
-                } else {
-                    None
-                }
-            };
-
-            if let Some(pair) = pair {
+            // RFC 8445 §7.3.1.5: once a pair is already nominated, subsequent
+            // USE-CANDIDATE (e.g. keepalives from other candidates) must not
+            // trigger re-nomination.  Guard here to prevent pair_monitor churn.
+            if inner.selected_pair.lock().is_some() {
                 trace!(
-                    "Controlled agent selected pair via UseCandidate: {} -> {}",
-                    pair.local.address, pair.remote.address
+                    "Controlled agent ignoring UseCandidate from {} – pair already nominated",
+                    addr
                 );
-                *inner.selected_pair.lock() = Some(pair.clone());
-                let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-                if let Some(socket) = resolve_socket(&inner, &pair) {
-                    let _ = inner.selected_socket.send(Some(socket));
-                }
-                let _ = inner.state.send(IceTransportState::Connected);
-                // Controlled side: nomination is decided by the controlling agent;
-                // once we receive USE-CANDIDATE, our "nomination" is complete.
-                let _ = inner.nomination_complete.send(Some(true));
             } else {
-                debug!(
-                    "Received UseCandidate but could not find pair for {} -> {}; \
-                     signalling nomination_complete=Some(true) as fallback",
-                    local_addr, addr
-                );
-                // Fallback: USE-CANDIDATE arrived before ICE checks completed
-                // (pair not yet in remote_candidates).  Signal nomination complete
-                // so peer_connection is not stuck waiting forever.
-                let _ = inner.nomination_complete.send(Some(true));
+                let local_addr = match sender {
+                    IceSocketWrapper::Udp(s) => s
+                        .local_addr()
+                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                    IceSocketWrapper::Turn(_, addr) => *addr,
+                };
+
+                let locals = inner.gatherer.local_candidates();
+                let local_cand = locals.iter().find(|c| c.base_address() == local_addr);
+
+                let pair = {
+                    let remotes = inner.remote_candidates.lock();
+                    let remote_cand = remotes.iter().find(|c| c.address == addr);
+                    if let (Some(l), Some(r)) = (local_cand, remote_cand) {
+                        Some(IceCandidatePair::new(l.clone(), r.clone()))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(pair) = pair {
+                    trace!(
+                        "Controlled agent selected pair via UseCandidate: {} -> {}",
+                        pair.local.address, pair.remote.address
+                    );
+                    *inner.selected_pair.lock() = Some(pair.clone());
+                    let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
+                    if let Some(socket) = resolve_socket(&inner, &pair) {
+                        let _ = inner.selected_socket.send(Some(socket));
+                    }
+                    let _ = inner.state.send(IceTransportState::Connected);
+                    // Controlled side: nomination is decided by the controlling agent;
+                    // once we receive USE-CANDIDATE, our "nomination" is complete.
+                    let _ = inner.nomination_complete.send(Some(true));
+                } else {
+                    debug!(
+                        "Received UseCandidate but could not find pair for {} -> {}; \
+                         signalling nomination_complete=Some(true) as fallback",
+                        local_addr, addr
+                    );
+                    // Fallback: USE-CANDIDATE arrived before ICE checks completed
+                    // (pair not yet in remote_candidates).  Signal nomination complete
+                    // so peer_connection is not stuck waiting forever.
+                    let _ = inner.nomination_complete.send(Some(true));
+                }
             }
         }
     }
@@ -1745,9 +1731,7 @@ async fn perform_binding_check(
                             match timeout(timeout_dur, bind_rx).await {
                                 Ok(Ok(msg)) => {
                                     if msg.class == StunClass::SuccessResponse {
-                                        client_clone
-                                            .add_channel(remote_addr, channel_num)
-                                            .await;
+                                        client_clone.add_channel(remote_addr, channel_num).await;
                                         debug!(
                                             "TURN ChannelBound: {} -> {}",
                                             remote_addr, channel_num
@@ -1757,8 +1741,7 @@ async fn perform_binding_check(
                                 _ => {
                                     // Timeout or error: clean up pending transaction
                                     if let Some(inner) = inner_weak.upgrade() {
-                                        let mut map =
-                                            inner.pending_transactions.lock();
+                                        let mut map = inner.pending_transactions.lock();
                                         map.remove(&bind_tx_id);
                                     }
                                 }
@@ -2412,10 +2395,7 @@ impl IceGatherer {
 
             // Try to discover gateway
             if let Err(e) = mapper.discover().await {
-                trace!(
-                    "UPnP discovery failed for {}: {}",
-                    local_addr, e
-                );
+                trace!("UPnP discovery failed for {}: {}", local_addr, e);
                 continue;
             }
 
@@ -2433,7 +2413,9 @@ impl IceGatherer {
                             addr.set_ip(public_ip);
                             debug!(
                                 "UPnP double-NAT detected: {} is private, using STUN public IP {} -> {}",
-                                external_addr.ip(), public_ip, addr
+                                external_addr.ip(),
+                                public_ip,
+                                addr
                             );
                             addr
                         } else {
@@ -2449,8 +2431,7 @@ impl IceGatherer {
                     };
 
                     // Create server reflexive candidate for the mapping
-                    let candidate =
-                        IceCandidate::server_reflexive(local_addr, candidate_addr, 1);
+                    let candidate = IceCandidate::server_reflexive(local_addr, candidate_addr, 1);
                     self.push_candidate(candidate);
 
                     // Store mapper for later cleanup
@@ -2516,7 +2497,8 @@ impl IceGatherer {
     /// This is used to detect and fix double-NAT scenarios for UPnP.
     async fn gather_servers_and_get_public_ip(&self) -> Option<IpAddr> {
         let mut tasks = FuturesUnordered::new();
-        let public_ip: Arc<parking_lot::Mutex<Option<IpAddr>>> = Arc::new(parking_lot::Mutex::new(None));
+        let public_ip: Arc<parking_lot::Mutex<Option<IpAddr>>> =
+            Arc::new(parking_lot::Mutex::new(None));
 
         for server in &self.config.ice_servers {
             for url in &server.urls {
@@ -2577,7 +2559,9 @@ impl IceGatherer {
         let addr = uri.resolve(self.config.disable_ipv6).await?;
 
         // Find a suitable host address to bind to (prefer non-loopback IPv4)
-        let bind_ip = self.local_candidates.lock()
+        let bind_ip = self
+            .local_candidates
+            .lock()
             .iter()
             .filter(|c| c.typ == IceCandidateType::Host)
             .filter_map(|c| match c.address.ip() {
@@ -2588,12 +2572,8 @@ impl IceGatherer {
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
 
         let socket = match uri.transport {
-            IceTransportProtocol::Udp => {
-                self.bind_socket(bind_ip).await?
-            }
-            IceTransportProtocol::Tcp => {
-                self.bind_socket(bind_ip).await?
-            }
+            IceTransportProtocol::Udp => self.bind_socket(bind_ip).await?,
+            IceTransportProtocol::Tcp => self.bind_socket(bind_ip).await?,
         };
         let local_addr = socket.local_addr()?;
         let tx_id = random_bytes::<12>();

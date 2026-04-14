@@ -2,7 +2,7 @@ use super::*;
 use crate::config::RtcConfigurationBuilder;
 use crate::transports::PacketReceiver;
 use crate::transports::ice::upnp::{
-    PortMapping, UpnpPortMapper, DEFAULT_LEASE_DURATION, MAX_LEASE_DURATION, MIN_LEASE_DURATION,
+    DEFAULT_LEASE_DURATION, MAX_LEASE_DURATION, MIN_LEASE_DURATION, PortMapping, UpnpPortMapper,
 };
 use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 use ::turn::{
@@ -1515,7 +1515,12 @@ async fn test_turn_refresh_succeeds_normally() -> Result<()> {
         }
     }
     // Add the relay candidate so selected_pair resolves
-    transport.inner.gatherer.local_candidates.lock().extend(candidates);
+    transport
+        .inner
+        .gatherer
+        .local_candidates
+        .lock()
+        .extend(candidates);
 
     // Set up a relay-type selected pair
     let remote = IceCandidate::host("127.0.0.1:9999".parse().unwrap(), 1);
@@ -1995,7 +2000,7 @@ fn test_port_mapping_expiry() {
 
     // Should not be expired immediately (70 > 60)
     assert!(!mapping.is_expired_or_stale());
-    
+
     // Check remaining lifetime is around 70
     let remaining = mapping.remaining_lifetime();
     assert!(remaining >= 69 && remaining <= 70);
@@ -2019,7 +2024,10 @@ fn test_port_mapping_remaining_lifetime() {
     // After sleeping, remaining should decrease or stay same (not increase)
     std::thread::sleep(std::time::Duration::from_millis(100));
     let new_remaining = mapping.remaining_lifetime();
-    assert!(new_remaining <= remaining, "new_remaining should not increase");
+    assert!(
+        new_remaining <= remaining,
+        "new_remaining should not increase"
+    );
 }
 
 /// Test UpnpPortMapper creation with default lease duration
@@ -2099,10 +2107,7 @@ async fn test_upnp_mapper_no_gateway() {
 
     let result = mapper.add_mapping(12345).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("No UPnP gateway"));
+    assert!(result.unwrap_err().to_string().contains("No UPnP gateway"));
 }
 
 /// Test UpnpPortMapper clone behavior
@@ -2124,7 +2129,10 @@ async fn test_upnp_mapper_clone() {
 fn test_config_upnp_defaults() {
     let config = RtcConfiguration::default();
     assert!(!config.enable_upnp, "UPnP should be disabled by default");
-    assert_eq!(config.upnp_lease_duration, 3600, "Default lease should be 1 hour");
+    assert_eq!(
+        config.upnp_lease_duration, 3600,
+        "Default lease should be 1 hour"
+    );
 }
 
 /// Test RtcConfigurationBuilder UPnP methods
@@ -2156,7 +2164,10 @@ async fn test_upnp_disabled_when_relay_policy() {
     // In Relay-only mode, we shouldn't have any UPnP mappers
     // (though we might have relay candidates if TURN servers are configured)
     let mappers = gatherer.upnp_mappers.lock();
-    assert!(mappers.is_empty(), "UPnP should not be used in Relay-only mode");
+    assert!(
+        mappers.is_empty(),
+        "UPnP should not be used in Relay-only mode"
+    );
 }
 
 /// Test that UPnP gathering is skipped when disabled in config
@@ -2178,7 +2189,10 @@ async fn test_upnp_disabled_in_config() {
     assert!(has_host, "Should have host candidates");
 
     let mappers = gatherer.upnp_mappers.lock();
-    assert!(mappers.is_empty(), "Should not have UPnP mappers when disabled");
+    assert!(
+        mappers.is_empty(),
+        "Should not have UPnP mappers when disabled"
+    );
 }
 
 /// Test cleanup_upnp_mappings method
@@ -2296,7 +2310,10 @@ async fn test_rtp_mode_upnp_disabled() {
     assert!(!candidates.is_empty());
 
     // Candidate should use local address (not UPnP external)
-    let host_candidate = candidates.iter().find(|c| c.typ == IceCandidateType::Host).unwrap();
+    let host_candidate = candidates
+        .iter()
+        .find(|c| c.typ == IceCandidateType::Host)
+        .unwrap();
     assert_eq!(host_candidate.address.port(), local_addr.port());
 
     // Should not have UPnP mappers when disabled
@@ -2317,9 +2334,199 @@ async fn test_rtp_mode_upnp_enabled_graceful() {
 
     // Setup direct RTP (offer side) - UPnP will fail in test env but should be graceful
     let result = transport.setup_direct_rtp_offer().await;
-    assert!(result.is_ok(), "setup_direct_rtp_offer should succeed even if UPnP fails");
+    assert!(
+        result.is_ok(),
+        "setup_direct_rtp_offer should succeed even if UPnP fails"
+    );
 
     // Should have a local candidate
     let candidates = transport.local_candidates();
     assert!(!candidates.is_empty());
+}
+
+// ── Regression tests for USE-CANDIDATE re-nomination bug ────────────────────
+
+/// Baseline: the very first USE-CANDIDATE received on the controlled side must
+/// nominate the pair and move the state to Connected.
+#[tokio::test]
+async fn use_candidate_nominates_first_pair() -> Result<()> {
+    let (t1, r1) = IceTransportBuilder::new(RtcConfiguration::default())
+        .role(IceRole::Controlling)
+        .build();
+    let (t2, r2) = IceTransportBuilder::new(RtcConfiguration::default())
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(r1);
+    tokio::spawn(r2);
+
+    for c in t1.local_candidates() {
+        t2.add_remote_candidate(c);
+    }
+    for c in t2.local_candidates() {
+        t1.add_remote_candidate(c);
+    }
+    let t1c = t1.clone();
+    let t2c = t2.clone();
+    let mut cand_rx1 = t1.subscribe_candidates();
+    let mut cand_rx2 = t2.subscribe_candidates();
+    tokio::spawn(async move {
+        while let Ok(c) = cand_rx1.recv().await {
+            t2c.add_remote_candidate(c);
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(c) = cand_rx2.recv().await {
+            t1c.add_remote_candidate(c);
+        }
+    });
+
+    t1.start(t2.local_parameters())?;
+    t2.start(t1.local_parameters())?;
+
+    let wait_connected = |mut rx: watch::Receiver<IceTransportState>| async move {
+        loop {
+            if *rx.borrow_and_update() == IceTransportState::Connected {
+                return Ok::<_, anyhow::Error>(());
+            }
+            if rx.changed().await.is_err() {
+                anyhow::bail!("state channel closed");
+            }
+        }
+    };
+
+    timeout(
+        Duration::from_secs(10),
+        futures::future::try_join(
+            wait_connected(t1.subscribe_state()),
+            wait_connected(t2.subscribe_state()),
+        ),
+    )
+    .await
+    .context("timed out waiting for ICE connection")??;
+
+    // Controlled side must have a selected pair after nomination.
+    assert!(
+        t2.get_selected_pair().await.is_some(),
+        "controlled side must have a selected pair after the first USE-CANDIDATE"
+    );
+
+    Ok(())
+}
+
+/// Regression test: after a pair is nominated on the controlled side, any
+/// subsequent STUN Binding Requests that carry USE-CANDIDATE (keepalives or
+/// probes from other candidates) must NOT trigger re-nomination.
+///
+/// Before the fix, `selected_pair_notifier` was fired on every such packet,
+/// causing PeerConnection to log "pair_monitor update" continuously and
+/// potentially switch the active pair.
+#[tokio::test]
+async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
+    // 1. Connect two ICE agents (controlling + controlled).
+    let (t1, r1) = IceTransportBuilder::new(RtcConfiguration::default())
+        .role(IceRole::Controlling)
+        .build();
+    let (t2, r2) = IceTransportBuilder::new(RtcConfiguration::default())
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(r1);
+    tokio::spawn(r2);
+
+    for c in t1.local_candidates() {
+        t2.add_remote_candidate(c);
+    }
+    for c in t2.local_candidates() {
+        t1.add_remote_candidate(c);
+    }
+    let t1c = t1.clone();
+    let t2c = t2.clone();
+    let mut cand_rx1 = t1.subscribe_candidates();
+    let mut cand_rx2 = t2.subscribe_candidates();
+    tokio::spawn(async move {
+        while let Ok(c) = cand_rx1.recv().await {
+            t2c.add_remote_candidate(c);
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(c) = cand_rx2.recv().await {
+            t1c.add_remote_candidate(c);
+        }
+    });
+
+    t1.start(t2.local_parameters())?;
+    t2.start(t1.local_parameters())?;
+
+    let wait_connected = |mut rx: watch::Receiver<IceTransportState>| async move {
+        loop {
+            if *rx.borrow_and_update() == IceTransportState::Connected {
+                return Ok::<_, anyhow::Error>(());
+            }
+            if rx.changed().await.is_err() {
+                anyhow::bail!("state channel closed");
+            }
+        }
+    };
+
+    timeout(
+        Duration::from_secs(10),
+        futures::future::try_join(
+            wait_connected(t1.subscribe_state()),
+            wait_connected(t2.subscribe_state()),
+        ),
+    )
+    .await
+    .context("timed out waiting for ICE connection")??;
+
+    // 2. Record the nominated pair and subscribe to future pair changes.
+    let nominated_pair = t2
+        .get_selected_pair()
+        .await
+        .expect("controlled side must have a selected pair after nomination");
+
+    let mut pair_rx = t2.subscribe_selected_pair();
+    // Mark the current value as "seen" so has_changed() only fires for
+    // updates that happen after this point.
+    let _ = pair_rx.borrow_and_update();
+
+    // 3. Register a fake second "remote candidate" whose address is different
+    //    from the currently nominated remote.  This simulates the browser
+    //    keepalive arriving from a different candidate (srflx / relay).
+    let second_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let second_addr = second_socket.local_addr()?;
+    assert_ne!(
+        second_addr, nominated_pair.remote.address,
+        "second socket must be a distinct address"
+    );
+    t2.add_remote_candidate(IceCandidate::host(second_addr, 1));
+
+    // 4. Send a raw STUN Binding Request with USE-CANDIDATE from that socket
+    //    directly to the controlled agent's listening address.
+    //    (handle_stun_request does not enforce HMAC, so a bare request suffices.)
+    let controlled_addr = nominated_pair.local.base_address();
+    let tx_id = random_bytes::<12>();
+    let mut msg = StunMessage::binding_request(tx_id, None);
+    msg.attributes.push(StunAttribute::UseCandidate);
+    let bytes = msg.encode(None, false)?;
+    second_socket.send_to(&bytes, controlled_addr).await?;
+
+    // 5. Allow time for the packet to be received and processed.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 6. Assert: selected_pair must not have changed.
+    assert!(
+        !pair_rx.has_changed().unwrap_or(true),
+        "selected_pair must NOT be updated by a USE-CANDIDATE after initial nomination \
+         (re-nomination guard is missing or broken)"
+    );
+
+    let final_pair = t2
+        .get_selected_pair()
+        .await
+        .expect("selected pair should still be present");
+    assert_eq!(
+        nominated_pair.remote.address, final_pair.remote.address,
+        "remote address of selected pair must not change after subsequent USE-CANDIDATE keepalives"
+    );
+
+    Ok(())
 }
